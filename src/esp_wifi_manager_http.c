@@ -11,6 +11,11 @@
 
 static const char *TAG = "wifi_mgr_http";
 
+//Neeed for support the new Android devices 
+#if (CONFIG_HTTPD_MAX_REQ_HDR_LEN < 2048) || (CONFIG_HTTPD_MAX_URI_LEN < 512)
+    #error 
+#endif
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -81,17 +86,16 @@ static esp_err_t send_json_response(httpd_req_t *req, cJSON *json)
 
     add_cors_headers(req);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, str, strlen(str));
+	esp_err_t ret = httpd_resp_send(req, str, strlen(str));
     free(str);
-    return ESP_OK;
+    return ret;
 }
 
 static esp_err_t send_ok(httpd_req_t *req)
 {
     add_cors_headers(req);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
+    return httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
 }
 
 static esp_err_t send_error(httpd_req_t *req, int code, const char *msg)
@@ -718,17 +722,16 @@ static esp_err_t handler_simple_page(httpd_req_t *req)
 {
     add_cors_headers(req);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, simple_page_html, strlen(simple_page_html));
-    return ESP_OK;
+    return httpd_resp_send(req, simple_page_html, strlen(simple_page_html));
 }
 
 // =============================================================================
 // Captive Portal
 // =============================================================================
-
 // Captive portal detection paths
 static const char *captive_detect_paths[] = {
-    "/generate_204",        // Android
+	"/redirect",            // Windows
+	"/generate_204",        // Android
     "/gen_204",             // Android alt
     "/hotspot-detect.html", // iOS/macOS
     "/library/test/success.html", // iOS
@@ -738,30 +741,6 @@ static const char *captive_detect_paths[] = {
     "/canonical.html",      // Firefox
     NULL
 };
-
-/**
- * @brief Captive portal detection handler - triggers OS popup
- */
-static esp_err_t handler_captive_detect(httpd_req_t *req)
-{
-    // Get AP IP for redirect
-    char redirect_url[64];
-    if (g_wifi_mgr->ap_config.ip[0]) {
-        snprintf(redirect_url, sizeof(redirect_url), "http://%s/", g_wifi_mgr->ap_config.ip);
-    } else {
-        snprintf(redirect_url, sizeof(redirect_url), "http://192.168.4.1/");
-    }
-
-    add_cors_headers(req);
-
-    // Return 302 redirect to trigger captive portal popup
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", redirect_url);
-    httpd_resp_send(req, NULL, 0);
-
-    ESP_LOGD(TAG, "Captive detect: %s -> %s", req->uri, redirect_url);
-    return ESP_OK;
-}
 
 // =============================================================================
 // Init / Deinit
@@ -783,6 +762,29 @@ static char uri_vars_wildcard[64];
 static char uri_factory_reset[64];
 static char uri_options_wildcard[64];
 
+/**
+ * @brief Captive portal detection handler - triggers OS popup
+ */
+static esp_err_t handler_captive_detect(httpd_req_t *req)
+{
+	// Get AP IP for redirect
+	char redirect_url[64];
+	if (g_wifi_mgr->ap_config.ip[0]) {
+		snprintf(redirect_url, sizeof(redirect_url), "http://%s", g_wifi_mgr->ap_config.ip);
+	}
+	else {
+		snprintf(redirect_url, sizeof(redirect_url), "http://192.168.4.1");
+	}
+
+	add_cors_headers(req);
+
+	// Return 302 redirect to trigger captive portal popup
+	httpd_resp_set_status(req, "302 Found");
+	httpd_resp_set_hdr(req, "Location", redirect_url);
+	ESP_LOGI(TAG, "Captive detect: %s -> %s", req->uri, redirect_url);
+	return httpd_resp_send(req, NULL, 0);
+}
+
 esp_err_t wifi_mgr_http_init(void)
 {
     if (!g_wifi_mgr) return ESP_ERR_INVALID_STATE;
@@ -796,6 +798,7 @@ esp_err_t wifi_mgr_http_init(void)
     if (!g_wifi_mgr->httpd) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.uri_match_fn = httpd_uri_match_wildcard;
+	    //config.max_resp_headers = 20; // По подразбиране е 8	    
         config.max_uri_handlers = 32;  // API(18) + WebUI(3) + Captive(8) + reserve
 
         esp_err_t ret = httpd_start(&g_wifi_mgr->httpd, &config);
@@ -896,12 +899,12 @@ esp_err_t wifi_mgr_http_init(void)
     if (g_wifi_mgr->config.enable_captive_portal) {
         for (int i = 0; captive_detect_paths[i] != NULL; i++) {
             httpd_uri_t captive_uri = {
-                .uri = captive_detect_paths[i],
-                .method = HTTP_GET,
-                .handler = handler_captive_detect
+	            .uri = captive_detect_paths[i],
+	            .method = HTTP_GET,
+	            .handler = handler_captive_detect
             };
             httpd_register_uri_handler(g_wifi_mgr->httpd, &captive_uri);
-        }
+        }    
         ESP_LOGI(TAG, "Captive portal detection enabled");
     }
 
