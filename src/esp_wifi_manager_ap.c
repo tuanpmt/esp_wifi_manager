@@ -97,7 +97,12 @@ esp_err_t wifi_manager_start_ap(const wifi_mgr_ap_config_t *config)
         esp_netif_set_ip_info(g_wifi_mgr->ap_netif, &ip_info);
         esp_netif_dhcps_start(g_wifi_mgr->ap_netif);
     }
-    
+
+    // Emit AP start event after config is fully applied, so listeners
+    // see the correct SSID/IP. This avoids spurious events from
+    // intermediate driver restarts (set_mode then set_config).
+    esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_AP_START, NULL, 0);
+
     return ESP_OK;
 }
 
@@ -112,6 +117,8 @@ esp_err_t wifi_manager_stop_ap(void)
 
     g_wifi_mgr->ap_active = false;
     esp_wifi_set_mode(WIFI_MODE_STA);
+
+    esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_AP_STOP, NULL, 0);
 
     return ESP_OK;
 }
