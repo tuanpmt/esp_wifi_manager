@@ -112,3 +112,88 @@ bool wifi_mgr_sm_uri_last_segment(char *dst, size_t dst_size, const char *uri)
     dst[n] = '\0';
     return true;
 }
+
+bool wifi_mgr_sm_sanitize_path(char *dst, size_t dst_size, const char *uri)
+{
+    if (!dst || dst_size == 0 || !uri || uri[0] != '/') {
+        return false;
+    }
+    dst[0] = '\0';
+
+    size_t n = 0;
+    size_t uri_len = strcspn(uri, "?#");
+    for (size_t i = 0; i < uri_len; i++) {
+        char c = uri[i];
+        if (c == '%') {
+            if (i + 2 >= uri_len) return false;
+            int hi = hex_value(uri[i + 1]);
+            int lo = hex_value(uri[i + 2]);
+            if (hi < 0 || lo < 0) return false;
+            c = (char)((hi << 4) | lo);
+            i += 2;
+        }
+        if (c == '\0' || c == '\\') return false;
+        if (n + 1 >= dst_size) {
+            dst[0] = '\0';
+            return false;
+        }
+        dst[n++] = c;
+    }
+    dst[n] = '\0';
+
+    // Reject any ".." path segment (after decoding)
+    for (const char *seg = dst; *seg; ) {
+        seg++;  // skip '/'
+        size_t len = strcspn(seg, "/");
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            dst[0] = '\0';
+            return false;
+        }
+        seg += len;
+    }
+    return true;
+}
+
+static bool ends_with_ci(const char *s, size_t len, const char *suffix)
+{
+    size_t sl = strlen(suffix);
+    if (len < sl) return false;
+    const char *p = s + len - sl;
+    for (size_t i = 0; i < sl; i++) {
+        char a = p[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != suffix[i]) return false;
+    }
+    return true;
+}
+
+const char *wifi_mgr_sm_mime_type(const char *path)
+{
+    static const struct { const char *ext; const char *type; } types[] = {
+        { ".html",  "text/html" },
+        { ".htm",   "text/html" },
+        { ".js",    "application/javascript" },
+        { ".mjs",   "application/javascript" },
+        { ".css",   "text/css" },
+        { ".json",  "application/json" },
+        { ".png",   "image/png" },
+        { ".jpg",   "image/jpeg" },
+        { ".jpeg",  "image/jpeg" },
+        { ".gif",   "image/gif" },
+        { ".webp",  "image/webp" },
+        { ".svg",   "image/svg+xml" },
+        { ".ico",   "image/x-icon" },
+        { ".woff2", "font/woff2" },
+        { ".woff",  "font/woff" },
+        { ".ttf",   "font/ttf" },
+        { ".txt",   "text/plain" },
+    };
+    if (!path) return "application/octet-stream";
+    size_t len = strlen(path);
+    // "foo.js.gz" is served as foo.js with Content-Encoding: gzip
+    if (ends_with_ci(path, len, ".gz")) len -= 3;
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        if (ends_with_ci(path, len, types[i].ext)) return types[i].type;
+    }
+    return "application/octet-stream";
+}

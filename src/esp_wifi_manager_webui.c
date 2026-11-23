@@ -5,6 +5,7 @@
 
 #include "esp_wifi_manager_priv.h"
 #include "esp_log.h"
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -38,43 +39,40 @@ static const char *get_fs_base_path(void)
 }
 
 /**
- * @brief Determine MIME content type from file path
+ * @brief Try to serve a file from the custom filesystem path (SPIFFS/LittleFS)
+ *
+ * @param uri Request URI or fixed asset path; sanitized before use.
+ *            A pre-compressed "<file>.gz" is preferred when present.
  */
-static const char *get_content_type(const char *filepath)
-{
-    if (strstr(filepath, ".html")) return "text/html";
-    if (strstr(filepath, ".js"))   return "application/javascript";
-    if (strstr(filepath, ".css"))  return "text/css";
-    if (strstr(filepath, ".json")) return "application/json";
-    if (strstr(filepath, ".png"))  return "image/png";
-    if (strstr(filepath, ".svg"))  return "image/svg+xml";
-    if (strstr(filepath, ".ico"))  return "image/x-icon";
-    if (strstr(filepath, ".jpg") || strstr(filepath, ".jpeg")) return "image/jpeg";
-    if (strstr(filepath, ".woff2")) return "font/woff2";
-    if (strstr(filepath, ".woff")) return "font/woff";
-    if (strstr(filepath, ".ttf"))  return "font/ttf";
-    if (strstr(filepath, ".gif"))  return "image/gif";
-    if (strstr(filepath, ".webp")) return "image/webp";
-    return "text/plain";
-}
-
-/**
- * @brief Try to serve file from custom filesystem path (SPIFFS/LittleFS)
- */
-static bool serve_from_filesystem(httpd_req_t *req, const char *filepath)
+static bool serve_from_filesystem(httpd_req_t *req, const char *uri)
 {
     const char *base_path = get_fs_base_path();
     if (!base_path) {
         return false;
     }
 
-    char fullpath[128];
-    snprintf(fullpath, sizeof(fullpath), "%s%s", base_path, filepath);
-
-    // Check if file exists
-    struct stat st;
-    if (stat(fullpath, &st) != 0) {
+    char relpath[96];
+    if (!wifi_mgr_sm_sanitize_path(relpath, sizeof(relpath), uri)) {
+        ESP_LOGW(TAG, "Rejected path: %s", uri);
         return false;
+    }
+    if (strcmp(relpath, "/") == 0) {
+        strcpy(relpath, "/index.html");
+    }
+
+    char fullpath[160];
+    int n = snprintf(fullpath, sizeof(fullpath), "%s%s.gz", base_path, relpath);
+    if (n < 0 || n >= (int)sizeof(fullpath)) {
+        return false;
+    }
+
+    struct stat st;
+    bool gzipped = stat(fullpath, &st) == 0 && S_ISREG(st.st_mode);
+    if (!gzipped) {
+        fullpath[n - 3] = '\0';  // drop ".gz"
+        if (stat(fullpath, &st) != 0 || !S_ISREG(st.st_mode)) {
+            return false;
+        }
     }
 
     FILE *f = fopen(fullpath, "r");
@@ -82,29 +80,27 @@ static bool serve_from_filesystem(httpd_req_t *req, const char *filepath)
         return false;
     }
 
-    httpd_resp_set_type(req, get_content_type(filepath));
+    httpd_resp_set_type(req, wifi_mgr_sm_mime_type(relpath));
+    if (gzipped) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    }
 
-    // Check for gzipped version
-    char gzpath[132];
-    snprintf(gzpath, sizeof(gzpath), "%s.gz", fullpath);
-    if (stat(gzpath, &st) == 0) {
+    char *buf = malloc(1024);
+    if (!buf) {
         fclose(f);
-        f = fopen(gzpath, "r");
-        if (f) {
-            httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-        }
+        return false;
     }
-
-    // Stream file
-    char buf[512];
     size_t read_bytes;
-    while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
-        httpd_resp_send_chunk(req, buf, read_bytes);
+    esp_err_t ret = ESP_OK;
+    while (ret == ESP_OK && (read_bytes = fread(buf, 1, 1024, f)) > 0) {
+        ret = httpd_resp_send_chunk(req, buf, read_bytes);
     }
-    httpd_resp_send_chunk(req, NULL, 0);
-
+    if (ret == ESP_OK) {
+        httpd_resp_send_chunk(req, NULL, 0);
+    }
+    free(buf);
     fclose(f);
-    ESP_LOGD(TAG, "Served from filesystem: %s", filepath);
+    ESP_LOGD(TAG, "Served from filesystem: %s", fullpath);
     return true;
 }
 
@@ -177,6 +173,10 @@ static esp_err_t handler_webui_wildcard(httpd_req_t *req)
         return ESP_OK;
     }
 
+    // Unknown path: send captive clients to the portal, others get 404
+    if (g_wifi_mgr && g_wifi_mgr->ap_active && g_wifi_mgr->config.enable_captive_portal) {
+        return wifi_mgr_http_captive_redirect(req);
+    }
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
     return ESP_FAIL;
 }
@@ -200,21 +200,21 @@ esp_err_t wifi_mgr_webui_init(httpd_handle_t httpd)
         .method = HTTP_GET,
         .handler = handler_webui_index,
     };
-    httpd_register_uri_handler(httpd, &index_uri);
+    wifi_mgr_http_register(&index_uri);
 
     httpd_uri_t app_js_uri = {
         .uri = "/assets/app.js",
         .method = HTTP_GET,
         .handler = handler_webui_app_js,
     };
-    httpd_register_uri_handler(httpd, &app_js_uri);
+    wifi_mgr_http_register(&app_js_uri);
 
     httpd_uri_t css_uri = {
         .uri = "/assets/index.css",
         .method = HTTP_GET,
         .handler = handler_webui_index_css,
     };
-    httpd_register_uri_handler(httpd, &css_uri);
+    wifi_mgr_http_register(&css_uri);
 
     // Register wildcard handler for additional static files from filesystem
     if (fs_path) {
@@ -223,7 +223,7 @@ esp_err_t wifi_mgr_webui_init(httpd_handle_t httpd)
             .method = HTTP_GET,
             .handler = handler_webui_wildcard,
         };
-        httpd_register_uri_handler(httpd, &wildcard_uri);
+        wifi_mgr_http_register(&wildcard_uri);
         ESP_LOGI(TAG, "Wildcard file serving enabled from %s", fs_path);
     }
 

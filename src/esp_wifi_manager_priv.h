@@ -226,6 +226,8 @@ esp_err_t wifi_mgr_nvs_factory_reset(void);
 
 esp_err_t wifi_mgr_http_init(void);
 esp_err_t wifi_mgr_http_unregister_handlers(void);
+esp_err_t wifi_mgr_http_register(const httpd_uri_t *uri);
+esp_err_t wifi_mgr_http_captive_redirect(httpd_req_t *req);
 esp_err_t wifi_mgr_http_deinit(void);
 
 // =============================================================================

@@ -51,6 +51,19 @@ bool wifi_mgr_sm_migrate_ssid32_blob(const void *old_blob, size_t old_len,
  */
 bool wifi_mgr_sm_uri_last_segment(char *dst, size_t dst_size, const char *uri);
 
+/**
+ * @brief Turn a request URI into a safe relative file path
+ *
+ * Strips query/fragment, percent-decodes, requires a leading '/', and rejects
+ * '..' segments, backslashes and results that do not fit in dst.
+ */
+bool wifi_mgr_sm_sanitize_path(char *dst, size_t dst_size, const char *uri);
+
+/**
+ * @brief MIME type from file extension (case-insensitive suffix match)
+ */
+const char *wifi_mgr_sm_mime_type(const char *path);
+
 #ifdef __cplusplus
 }
 #endif

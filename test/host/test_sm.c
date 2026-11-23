@@ -222,6 +222,50 @@ static void test_uri_segment_rejects_bad_escape_and_empty(void)
     EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/%00x"), 0);
 }
 
+// --- Static file path sanitizing (Web UI wildcard handler) -----------------
+
+static void test_path_accepts_normal_file(void)
+{
+    char out[64];
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/assets/logo.png?v=2"), 1);
+    EXPECT_EQ(strcmp(out, "/assets/logo.png"), 0);
+}
+
+static void test_path_rejects_traversal(void)
+{
+    char out[64];
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/../secret.txt"), 0);
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/assets/../../x"), 0);
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/assets/%2e%2e/x"), 0);
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/a\\..\\b"), 0);
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "assets/x"), 0);
+}
+
+static void test_path_allows_dots_inside_names(void)
+{
+    char out[64];
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/app..min.js"), 1);
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/.well-known/x"), 1);
+}
+
+static void test_path_rejects_overflow(void)
+{
+    char out[8];
+    EXPECT_EQ(wifi_mgr_sm_sanitize_path(out, sizeof(out), "/abcdefgh"), 0);
+}
+
+// --- MIME types --------------------------------------------------------------
+
+static void test_mime_matches_suffix_not_substring(void)
+{
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/data.json"), "application/json"), 0);
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/app.js"), "application/javascript"), 0);
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/my.json.backup"), "application/octet-stream"), 0);
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/INDEX.HTML"), "text/html"), 0);
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/style.css"), "text/css"), 0);
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/noext"), "application/octet-stream"), 0);
+}
+
 int main(void)
 {
     RUN(test_disconnect_during_connect_sequence_is_stale);
@@ -245,6 +289,11 @@ int main(void)
     RUN(test_uri_segment_keeps_plus_literal);
     RUN(test_uri_segment_rejects_overflow);
     RUN(test_uri_segment_rejects_bad_escape_and_empty);
+    RUN(test_path_accepts_normal_file);
+    RUN(test_path_rejects_traversal);
+    RUN(test_path_allows_dots_inside_names);
+    RUN(test_path_rejects_overflow);
+    RUN(test_mime_matches_suffix_not_substring);
 
     if (failures) {
         printf("\n%d assertion(s) failed\n", failures);

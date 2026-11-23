@@ -7,3 +7,6 @@ CONFIG_WIFI_MGR_WEBUI_CUSTOM_PATH="/littlefs"
 # Partition table
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Captive portal: modern Android/Chrome probes send long headers (default 512 -> HTTP 431)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

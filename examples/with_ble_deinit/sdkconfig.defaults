@@ -11,3 +11,6 @@ CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
 # WiFi Manager BLE
 CONFIG_WIFI_MGR_ENABLE_BLE=y
 CONFIG_WIFI_MGR_BLE_DEVICE_NAME="ESP32-WiFi-{id}"
+
+# Captive portal: modern Android/Chrome probes send long headers (default 512 -> HTTP 431)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

@@ -2,3 +2,6 @@ CONFIG_IDF_TARGET="esp32s3"
 
 # Enable WiFi Manager Web UI
 CONFIG_WIFI_MGR_ENABLE_WEBUI=y
+
+# Captive portal: modern Android/Chrome probes send long headers (default 512 -> HTTP 431)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
