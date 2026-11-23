@@ -164,6 +164,10 @@ def post_connect():
     elif state["networks"]:
         ssid = state["networks"][0]["ssid"]
 
+    # Mirror firmware: only saved networks can be connected to
+    if ssid is not None and not any(n["ssid"] == ssid for n in state["networks"]):
+        return error(404, "Network not saved")
+
     sta = state["sta"]
     sta["state"] = "connected"
     sta["ssid"] = ssid or ""
@@ -211,17 +215,27 @@ def post_networks():
         return error(400, "Missing ssid")
 
     ssid = body["ssid"]
-    password = body.get("password", "")
-    priority = body.get("priority", 0)
+    if not isinstance(ssid, str) or not ssid or len(ssid.encode()) > 32:
+        return error(400, "Failed")
 
-    # Upsert
+    # Upsert, mirroring firmware: omitted (or null) fields keep saved values
+    password = body.get("password")
+    priority = body.get("priority")
     for net in state["networks"]:
         if net["ssid"] == ssid:
-            net["password"] = password
-            net["priority"] = priority
+            if password is not None:
+                net["password"] = password
+            if priority is not None:
+                net["priority"] = priority
             return ok()
 
-    state["networks"].append({"ssid": ssid, "password": password, "priority": priority})
+    if len(state["networks"]) >= 5:  # CONFIG_WIFI_MGR_MAX_NETWORKS default
+        return error(400, "Network list full")
+    state["networks"].append({
+        "ssid": ssid,
+        "password": password or "",
+        "priority": 10 if priority is None else priority,
+    })
     return ok()
 
 

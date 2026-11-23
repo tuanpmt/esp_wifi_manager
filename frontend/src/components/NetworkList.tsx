@@ -15,6 +15,9 @@ export function NetworkList({ onConnect }: Props) {
   const [selectedSsid, setSelectedSsid] = useState<string | null>(null);
   const [password, setPassword] = useState('');
   const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
+  const [hiddenSsid, setHiddenSsid] = useState('');
 
   const scan = async () => {
     setScanning(true);
@@ -28,23 +31,31 @@ export function NetworkList({ onConnect }: Props) {
     }
   };
 
-  const connect = async (ssid: string) => {
+  const connect = async (ssid: string, open: boolean) => {
     setConnecting(true);
+    setError(null);
     try {
-      // Add network first if password provided
-      if (password) {
+      // Save the network when credentials are given, or when it is open
+      // (an unsaved open network cannot be connected to by SSID alone).
+      // Leaving the password empty for a secured network reuses the saved one.
+      if (password || open) {
         await api.addNetwork(ssid, password);
       }
       await api.connect(ssid);
       onConnect(ssid);
       setSelectedSsid(null);
+      setShowHidden(false);
+      setHiddenSsid('');
       setPassword('');
     } catch (e) {
-      console.error('Connect failed:', e);
+      setError(e instanceof Error ? e.message : 'Connect failed');
     } finally {
       setConnecting(false);
     }
   };
+
+  // SSIDs are at most 32 bytes (UTF-8), not 32 characters
+  const ssidTooLong = new TextEncoder().encode(hiddenSsid).length > 32;
 
   return (
     <Card
@@ -55,6 +66,8 @@ export function NetworkList({ onConnect }: Props) {
         </Button>
       }
     >
+      {error && <div class="network-error text-sm">{error}</div>}
+
       {networks.length === 0 ? (
         <div class="network-empty">
           {scanning ? 'Scanning...' : 'Click Scan to find networks'}
@@ -66,7 +79,7 @@ export function NetworkList({ onConnect }: Props) {
               <div class="network-info">
                 <div class="network-ssid">
                   {net.auth !== 'OPEN' && <span class="lock">🔒</span>}
-                  {net.ssid || '(hidden)'}
+                  {net.ssid}
                 </div>
                 <div class="network-meta text-sm text-muted">
                   {net.rssi} dBm • {net.auth}
@@ -90,7 +103,7 @@ export function NetworkList({ onConnect }: Props) {
                     />
                   )}
                   <Button
-                    onClick={() => connect(net.ssid)}
+                    onClick={() => connect(net.ssid, net.auth === 'OPEN')}
                     loading={connecting}
                     class="w-full"
                   >
@@ -102,6 +115,47 @@ export function NetworkList({ onConnect }: Props) {
           ))}
         </div>
       )}
+
+      <div class="network-hidden">
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => {
+            setShowHidden(!showHidden);
+            setSelectedSsid(null);
+            setPassword('');
+          }}
+        >
+          {showHidden ? 'Cancel' : 'Hidden network...'}
+        </Button>
+
+        {showHidden && (
+          <div class="network-connect-form">
+            <input
+              type="text"
+              placeholder="Network name (SSID)"
+              value={hiddenSsid}
+              maxLength={32}
+              onInput={(e) => setHiddenSsid((e.target as HTMLInputElement).value)}
+            />
+            <input
+              type="password"
+              placeholder="Password (leave empty for open network)"
+              value={password}
+              onInput={(e) => setPassword((e.target as HTMLInputElement).value)}
+            />
+            {ssidTooLong && <div class="network-error text-sm">SSID must be at most 32 bytes</div>}
+            <Button
+              onClick={() => connect(hiddenSsid, password === '')}
+              loading={connecting}
+              disabled={!hiddenSsid || ssidTooLong}
+              class="w-full"
+            >
+              Connect
+            </Button>
+          </div>
+        )}
+      </div>
     </Card>
   );
 }

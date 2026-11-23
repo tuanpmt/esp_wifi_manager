@@ -390,8 +390,11 @@ static esp_err_t handler_post_connect(httpd_req_t *req)
         if (json) {
             cJSON *ssid_item = cJSON_GetObjectItem(json, "ssid");
             if (cJSON_IsString(ssid_item)) {
-                wifi_manager_connect(ssid_item->valuestring);
+                esp_err_t ret = wifi_manager_connect(ssid_item->valuestring);
                 cJSON_Delete(json);
+                if (ret == ESP_ERR_NOT_FOUND) {
+                    return send_error(req, 404, "Network not saved");
+                }
                 return send_ok(req);
             }
             cJSON_Delete(json);
