@@ -262,7 +262,7 @@ typedef enum {
  * Cấu hình 1 mạng WiFi. Priority cao hơn sẽ được thử kết nối trước.
  */
 typedef struct {
-    char ssid[32];          ///< SSID (max 31 chars)
+    char ssid[33];          ///< SSID (max 31 chars)
     char password[64];      ///< Password (max 63 chars)
     uint8_t priority;       ///< 0-255, cao = ưu tiên hơn
 } wifi_network_t;
@@ -274,7 +274,7 @@ typedef struct {
  */
 typedef struct {
     wifi_state_t state;     ///< Trạng thái kết nối
-    char ssid[32];          ///< SSID đang kết nối
+    char ssid[33];          ///< SSID đang kết nối
     uint8_t bssid[6];       ///< BSSID của AP
     int8_t rssi;            ///< Cường độ tín hiệu (dBm), -100 to 0
     uint8_t quality;        ///< Chất lượng tín hiệu 0-100%
@@ -300,7 +300,7 @@ typedef struct {
  * Kết quả quét 1 mạng WiFi xung quanh.
  */
 typedef struct {
-    char ssid[32];          ///< SSID
+    char ssid[33];          ///< SSID
     int8_t rssi;            ///< Cường độ tín hiệu (dBm)
     wifi_auth_mode_t auth;  ///< Auth mode: WIFI_AUTH_OPEN, WIFI_AUTH_WPA2_PSK, etc.
 } wifi_scan_result_t;
@@ -312,7 +312,7 @@ typedef struct {
  * @note Đổi tên thành wifi_mgr_ap_config_t để tránh conflict với ESP-IDF
  */
 typedef struct {
-    char ssid[32];          ///< AP SSID
+    char ssid[33];          ///< AP SSID
     char password[64];      ///< AP password (empty = open network)
     uint8_t channel;        ///< Channel 1-13, 0 = auto
     uint8_t max_connections;///< Max clients, default 4
@@ -335,7 +335,7 @@ typedef struct {
  */
 typedef struct {
     bool active;            ///< AP đang chạy?
-    char ssid[32];          ///< AP SSID
+    char ssid[33];          ///< AP SSID
     char ip[16];            ///< AP IP
     uint8_t channel;        ///< Channel
     uint8_t sta_count;      ///< Số clients kết nối
@@ -363,7 +363,7 @@ typedef struct {
  * Data được gửi kèm event WIFI_EVENT_CONNECTED.
  */
 typedef struct {
-    char ssid[32];          ///< SSID đã kết nối
+    char ssid[33];          ///< SSID đã kết nối
     int8_t rssi;            ///< RSSI khi kết nối
     uint8_t channel;        ///< Channel
 } wifi_connected_t;
@@ -374,13 +374,22 @@ typedef struct {
  * Data được gửi kèm event WIFI_EVENT_DISCONNECTED.
  */
 typedef struct {
-    char ssid[32];          ///< SSID đã ngắt
+    char ssid[33];          ///< SSID đã ngắt
     uint8_t reason;         ///< Reason code (wifi_err_reason_t)
 } wifi_disconnected_t;
 
 // =============================================================================
 // Configuration
 // =============================================================================
+
+/**
+ * @brief Pre-request hook callback
+ *
+ * Called before every API handler (after CORS, before auth check).
+ * Return ESP_OK to continue to the handler, ESP_FAIL to reject (sends 403).
+ * Only applies to /api/wifi/ endpoints, not static file serving.
+ */
+typedef esp_err_t (*wifi_mgr_http_hook_t)(httpd_req_t *req, void *ctx);
 
 /**
  * @brief HTTP interface configuration
@@ -394,6 +403,8 @@ typedef struct {
     bool enable_auth;           ///< Enable Basic Auth
     const char *auth_username;  ///< Auth username, default "admin"
     const char *auth_password;  ///< Auth password, default "admin"
+    wifi_mgr_http_hook_t pre_request_hook;  ///< Optional pre-request hook for API endpoints
+    void *hook_ctx;             ///< Context passed to pre_request_hook
 } wifi_mgr_http_config_t;
 
 /**
@@ -416,6 +427,14 @@ typedef struct {
     bool enable;                ///< Enable BLE interface
     const char *device_name;    ///< BLE device name, e.g., "ESP32-WiFi-{id}", default from Kconfig
 } wifi_mgr_ble_config_t;
+
+/**
+ * @brief Variable validation callback
+ *
+ * Called before writing a variable to NVS on PUT /api/wifi/vars/:key.
+ * Return ESP_OK to accept, ESP_FAIL to reject (API returns 400 with "var_invalid").
+ */
+typedef esp_err_t (*wifi_mgr_var_validator_t)(const char *key, const char *value, void *ctx);
 
 /**
  * @brief Main WiFi Manager configuration
@@ -446,7 +465,11 @@ typedef struct {
     bool enable_captive_portal;         ///< Start AP if all networks fail
     bool stop_ap_on_connect;            ///< Stop AP when STA connected successfully
     bool start_ap_on_init;              ///< Start AP immediately on init (AP+STA mode)
-    
+
+    // Callbacks
+    wifi_mgr_var_validator_t on_before_var_set;  ///< Optional variable validation callback
+    void *var_validator_ctx;                      ///< Context passed to on_before_var_set
+
     // Interfaces
     wifi_mgr_http_config_t http;        ///< HTTP REST API config
     wifi_mgr_mdns_config_t mdns;        ///< mDNS config
@@ -484,11 +507,11 @@ esp_err_t wifi_manager_init(const wifi_manager_config_t *config);
 /**
  * @brief Deinitialize WiFi Manager
  * 
- * Dừng WiFi, HTTP server và giải phóng resources.
+ * Stop the HTTP server, BLE, mDNS, and (optionally) WiFi interfaces. Free resources.
  * 
  * @return ESP_OK on success
  */
-esp_err_t wifi_manager_deinit(void);
+esp_err_t wifi_manager_deinit(bool deinit_wifi);
 
 /**
  * @brief Check if WiFi is connected

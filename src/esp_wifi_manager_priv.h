@@ -15,10 +15,71 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+#include "esp_wifi_manager_sm.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+
+// =============================================================================
+// Configuration Defaults - Typically set via menuconfig
+// =============================================================================
+
+
+#ifndef CONFIG_WIFI_MGR_MAX_NETWORKS
+#define CONFIG_WIFI_MGR_MAX_NETWORKS 5
+#endif
+
+#ifndef CONFIG_WIFI_MGR_MAX_VARS
+#define CONFIG_WIFI_MGR_MAX_VARS 10
+#endif
+
+#ifndef CONFIG_WIFI_MGR_DEFAULT_RETRY
+#define CONFIG_WIFI_MGR_DEFAULT_RETRY 3
+#endif
+
+#ifndef CONFIG_WIFI_MGR_RETRY_INTERVAL_MS
+#define CONFIG_WIFI_MGR_RETRY_INTERVAL_MS 5000
+#endif
+
+#ifndef CONFIG_WIFI_MGR_AP_SSID
+#define CONFIG_WIFI_MGR_AP_SSID "ESP32-Config"
+#endif
+
+#ifndef CONFIG_WIFI_MGR_AP_PASSWORD
+#define CONFIG_WIFI_MGR_AP_PASSWORD ""
+#endif
+
+#ifndef CONFIG_WIFI_MGR_AP_IP
+#define CONFIG_WIFI_MGR_AP_IP "192.168.4.1"
+#endif
+
+#ifndef CONFIG_WIFI_MGR_BLE_DEVICE_NAME
+#define CONFIG_WIFI_MGR_BLE_DEVICE_NAME "ESP32-WiFi-{id}"
+#endif
+
+#ifndef CONFIG_WIFI_MGR_MAX_SCAN_RESULTS
+#define CONFIG_WIFI_MGR_MAX_SCAN_RESULTS 20
+#endif
+
+#ifndef CONFIG_WIFI_MGR_HTTP_MAX_CONTENT_LEN
+#define CONFIG_WIFI_MGR_HTTP_MAX_CONTENT_LEN 2048
+#endif
+
+#ifndef CONFIG_WIFI_MGR_TASK_STACK_SIZE
+#define CONFIG_WIFI_MGR_TASK_STACK_SIZE 4096
+#endif
+
+#ifndef CONFIG_WIFI_MGR_TASK_PRIORITY
+#define CONFIG_WIFI_MGR_TASK_PRIORITY 5
+#endif
+
+#ifndef CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
+#define CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS 40
+#endif
+
 
 // =============================================================================
 // Constants
@@ -27,14 +88,21 @@ extern "C" {
 #define WIFI_MGR_NVS_NAMESPACE      "wifi_mgr"
 #define WIFI_MGR_MAX_NETWORKS       CONFIG_WIFI_MGR_MAX_NETWORKS
 #define WIFI_MGR_MAX_VARS           CONFIG_WIFI_MGR_MAX_VARS
-#define WIFI_MGR_TASK_STACK_SIZE    4096
-#define WIFI_MGR_TASK_PRIORITY      5
-#define WIFI_MGR_QUEUE_SIZE         10
+#define WIFI_MGR_MAX_SCAN_RESULTS   CONFIG_WIFI_MGR_MAX_SCAN_RESULTS
+#define WIFI_MGR_HTTP_MAX_CONTENT   CONFIG_WIFI_MGR_HTTP_MAX_CONTENT_LEN
+#define WIFI_MGR_TASK_STACK_SIZE    CONFIG_WIFI_MGR_TASK_STACK_SIZE
+#define WIFI_MGR_TASK_PRIORITY      CONFIG_WIFI_MGR_TASK_PRIORITY
+#define WIFI_MGR_HTTP_MAX_HANDLERS  CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
+#define WIFI_MGR_QUEUE_SIZE         16
+#define WIFI_MGR_DEFAULT_PRIORITY   10
 
 // Event bits (for sync waits)
 #define WIFI_CONNECTED_BIT          BIT0
 #define WIFI_FAIL_BIT               BIT1
 #define WIFI_SCAN_DONE_BIT          BIT2
+#define WIFI_STOP_BIT               BIT3    // deinit requested, abort waits
+#define WIFI_TASK_DONE_BIT          BIT4    // manager task has exited
+#define WIFI_ABORT_BIT              BIT5    // abort the running connect sequence (e.g. scan)
 
 // =============================================================================
 // Internal Events (sent to task queue)
@@ -55,6 +123,7 @@ typedef enum {
     WM_INT_EVT_DISCONNECT_REQUEST,  // Manual disconnect request
     WM_INT_EVT_START_AP_REQUEST,    // Manual start AP request
     WM_INT_EVT_STOP_AP_REQUEST,     // Manual stop AP request
+    WM_INT_EVT_RECONNECT,           // Backoff timer expired, run connect sequence
     WM_INT_EVT_STOP,                // Stop task
 } wifi_mgr_internal_evt_t;
 
@@ -62,11 +131,11 @@ typedef struct {
     wifi_mgr_internal_evt_t type;
     union {
         struct {
-            char ssid[32];
+            char ssid[33];
             uint8_t reason;
         } disconnect;
         struct {
-            char ssid[32];
+            char ssid[33];
             int8_t rssi;
             uint8_t channel;
         } connected;
@@ -74,7 +143,7 @@ typedef struct {
             esp_netif_ip_info_t ip_info;
         } got_ip;
         struct {
-            char ssid[32];
+            char ssid[33];
         } connect_req;
         uint8_t mac[6];
     } data;
@@ -89,7 +158,7 @@ typedef struct {
     wifi_state_t state;
     bool initialized;
     bool ap_active;
-    bool connecting;                // Currently in connect sequence
+    volatile bool connecting;       // Currently in connect sequence (read from event handler)
     int64_t connect_time;           // Connection start time
     
     // Config
@@ -123,6 +192,7 @@ typedef struct {
     SemaphoreHandle_t mutex;
     
     // Retry state
+    esp_timer_handle_t reconnect_timer;  // One-shot backoff timer (non-blocking reconnect)
     int retry_count;
     int current_network_idx;
     
@@ -155,6 +225,10 @@ esp_err_t wifi_mgr_nvs_factory_reset(void);
 // =============================================================================
 
 esp_err_t wifi_mgr_http_init(void);
+esp_err_t wifi_mgr_http_unregister_handlers(void);
+esp_err_t wifi_mgr_http_register(const httpd_uri_t *uri);
+esp_err_t wifi_mgr_http_captive_redirect(httpd_req_t *req);
+bool wifi_mgr_http_is_captive_client(httpd_req_t *req);
 esp_err_t wifi_mgr_http_deinit(void);
 
 // =============================================================================
@@ -167,6 +241,20 @@ void wifi_mgr_send_event_data(const wifi_mgr_event_t *event);
 
 // Start connect sequence (non-blocking, called from task)
 void wifi_mgr_start_connect_sequence(void);
+
+/**
+ * @brief Add or partially update a saved network
+ *
+ * @param ssid         SSID (required, max 32 bytes)
+ * @param password     New password, or NULL to keep the saved one (empty on create)
+ * @param priority     0-255, or -1 to keep the saved one (WIFI_MGR_DEFAULT_PRIORITY on create)
+ * @param allow_create Create the network if it does not exist
+ * @return ESP_OK, ESP_ERR_NOT_FOUND (!allow_create), ESP_ERR_NO_MEM (list full),
+ *         ESP_ERR_INVALID_ARG (bad ssid/password length)
+ */
+esp_err_t wifi_mgr_network_upsert(const char *ssid, const char *password, int priority, bool allow_create);
+void wifi_mgr_schedule_reconnect(void);
+void wifi_mgr_cancel_reconnect(void);
 
 // AP mode control (called from task)
 void wifi_mgr_start_ap_mode(void);

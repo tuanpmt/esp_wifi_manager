@@ -54,7 +54,7 @@ esp_err_t wifi_manager_start_ap(const wifi_mgr_ap_config_t *config)
     g_wifi_mgr->ap_active = true;
     
     // Expand SSID template (replace {id} with MAC suffix)
-    char ssid_expanded[32];
+    char ssid_expanded[33];
     wifi_mgr_expand_template(ap_cfg->ssid, ssid_expanded, sizeof(ssid_expanded));
     
     ESP_LOGI(TAG, "Starting AP: %s", ssid_expanded);
@@ -74,8 +74,10 @@ esp_err_t wifi_manager_start_ap(const wifi_mgr_ap_config_t *config)
             .ssid_hidden = ap_cfg->hidden,
         },
     };
-    strncpy((char *)wifi_cfg.ap.ssid, ssid_expanded, sizeof(wifi_cfg.ap.ssid) - 1);
-    wifi_cfg.ap.ssid_len = strlen(ssid_expanded);
+    // wifi_ap_config_t.ssid needs no terminator; ssid_len carries the length
+    size_t ssid_len = strnlen(ssid_expanded, sizeof(wifi_cfg.ap.ssid));
+    memcpy(wifi_cfg.ap.ssid, ssid_expanded, ssid_len);
+    wifi_cfg.ap.ssid_len = ssid_len;
     if (ap_cfg->password[0]) {
         strncpy((char *)wifi_cfg.ap.password, ap_cfg->password, sizeof(wifi_cfg.ap.password) - 1);
     }
@@ -97,7 +99,12 @@ esp_err_t wifi_manager_start_ap(const wifi_mgr_ap_config_t *config)
         esp_netif_set_ip_info(g_wifi_mgr->ap_netif, &ip_info);
         esp_netif_dhcps_start(g_wifi_mgr->ap_netif);
     }
-    
+
+    // Emit AP start event after config is fully applied, so listeners
+    // see the correct SSID/IP. This avoids spurious events from
+    // intermediate driver restarts (set_mode then set_config).
+    esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_AP_START, NULL, 0);
+
     return ESP_OK;
 }
 
@@ -112,6 +119,8 @@ esp_err_t wifi_manager_stop_ap(void)
 
     g_wifi_mgr->ap_active = false;
     esp_wifi_set_mode(WIFI_MODE_STA);
+
+    esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_AP_STOP, NULL, 0);
 
     return ESP_OK;
 }
@@ -187,7 +196,15 @@ esp_err_t wifi_manager_get_ap_config(wifi_mgr_ap_config_t *config)
 esp_err_t wifi_manager_set_var(const char *key, const char *value)
 {
     if (!g_wifi_mgr || !key || !value) return ESP_ERR_INVALID_ARG;
-    
+
+    // Run variable validation callback if configured
+    if (g_wifi_mgr->config.on_before_var_set) {
+        esp_err_t vret = g_wifi_mgr->config.on_before_var_set(key, value, g_wifi_mgr->config.var_validator_ctx);
+        if (vret != ESP_OK) {
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+
     wifi_mgr_lock();
     
     for (size_t i = 0; i < g_wifi_mgr->var_count; i++) {

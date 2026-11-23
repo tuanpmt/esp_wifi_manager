@@ -4,6 +4,7 @@
  */
 
 #include "esp_wifi_manager_priv.h"
+#include "lwip/sockets.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
@@ -81,17 +82,16 @@ static esp_err_t send_json_response(httpd_req_t *req, cJSON *json)
 
     add_cors_headers(req);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, str, strlen(str));
+    esp_err_t ret = httpd_resp_send(req, str, strlen(str));
     free(str);
-    return ESP_OK;
+    return ret;
 }
 
 static esp_err_t send_ok(httpd_req_t *req)
 {
     add_cors_headers(req);
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
+    return httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
 }
 
 static esp_err_t send_error(httpd_req_t *req, int code, const char *msg)
@@ -100,6 +100,7 @@ static esp_err_t send_error(httpd_req_t *req, int code, const char *msg)
     switch (code) {
         case 400: status = "400 Bad Request"; break;
         case 401: status = "401 Unauthorized"; break;
+        case 403: status = "403 Forbidden"; break;
         case 404: status = "404 Not Found"; break;
         case 500: status = "500 Internal Server Error"; break;
         default:  status = "400 Bad Request"; break;
@@ -115,6 +116,33 @@ static esp_err_t send_error(httpd_req_t *req, int code, const char *msg)
 }
 
 /**
+ * @brief Run pre-request hook and auth check for API handlers
+ *
+ * Calls the pre-request hook first (if configured), then the built-in auth check.
+ * Returns true if the request should proceed, false if rejected.
+ * On rejection, the appropriate error response has already been sent.
+ */
+static bool check_api_access(httpd_req_t *req)
+{
+    // Pre-request hook (called before auth, so hook can replace/supplement auth)
+    if (g_wifi_mgr->config.http.pre_request_hook) {
+        esp_err_t hook_ret = g_wifi_mgr->config.http.pre_request_hook(req, g_wifi_mgr->config.http.hook_ctx);
+        if (hook_ret != ESP_OK) {
+            send_error(req, 403, "Forbidden");
+            return false;
+        }
+    }
+
+    // Built-in auth check
+    if (!check_auth(req)) {
+        send_error(req, 401, "Unauthorized");
+        return false;
+    }
+
+    return true;
+}
+
+/**
  * @brief OPTIONS handler for CORS preflight
  */
 static esp_err_t handler_options(httpd_req_t *req)
@@ -127,7 +155,7 @@ static esp_err_t handler_options(httpd_req_t *req)
 static cJSON *read_json_body(httpd_req_t *req)
 {
     int content_len = req->content_len;
-    if (content_len <= 0 || content_len > 2048) {
+    if (content_len <= 0 || content_len > WIFI_MGR_HTTP_MAX_CONTENT) {
         return NULL;
     }
     
@@ -153,8 +181,8 @@ static cJSON *read_json_body(httpd_req_t *req)
 // GET /status
 static esp_err_t handler_get_status(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_status_t status;
@@ -185,14 +213,14 @@ static esp_err_t handler_get_status(httpd_req_t *req)
 // GET /scan
 static esp_err_t handler_get_scan(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
-    wifi_scan_result_t results[20];
+    wifi_scan_result_t results[WIFI_MGR_MAX_SCAN_RESULTS];
     size_t count = 0;
-    
-    esp_err_t ret = wifi_manager_scan(results, 20, &count);
+
+    esp_err_t ret = wifi_manager_scan(results, WIFI_MGR_MAX_SCAN_RESULTS, &count);
     if (ret != ESP_OK) {
         return send_error(req, 500, "Scan failed");
     }
@@ -227,8 +255,8 @@ static esp_err_t handler_get_scan(httpd_req_t *req)
 // GET /networks
 static esp_err_t handler_get_networks(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_network_t networks[WIFI_MGR_MAX_NETWORKS];
@@ -253,8 +281,8 @@ static esp_err_t handler_get_networks(httpd_req_t *req)
 // POST /networks
 static esp_err_t handler_post_networks(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     cJSON *json = read_json_body(req);
@@ -271,20 +299,18 @@ static esp_err_t handler_post_networks(httpd_req_t *req)
         return send_error(req, 400, "Missing ssid");
     }
     
-    wifi_network_t network = {0};
-    strncpy(network.ssid, ssid->valuestring, sizeof(network.ssid) - 1);
-    if (cJSON_IsString(password)) {
-        strncpy(network.password, password->valuestring, sizeof(network.password) - 1);
-    }
-    if (cJSON_IsNumber(priority)) {
-        network.priority = (uint8_t)priority->valueint;
-    }
-    
+    // Upsert: fields not present in the request keep their saved values
+    esp_err_t ret = wifi_mgr_network_upsert(ssid->valuestring,
+                                            cJSON_IsString(password) ? password->valuestring : NULL,
+                                            cJSON_IsNumber(priority) ? priority->valueint : -1,
+                                            true);
     cJSON_Delete(json);
-    
-    esp_err_t ret = wifi_manager_add_network(&network);
+
+    if (ret == ESP_ERR_NO_MEM) {
+        return send_error(req, 400, "Network list full");
+    }
     if (ret != ESP_OK) {
-        return send_error(req, 400, ret == ESP_ERR_INVALID_STATE ? "Already exists" : "Failed");
+        return send_error(req, 400, "Failed");
     }
     
     return send_ok(req);
@@ -293,17 +319,13 @@ static esp_err_t handler_post_networks(httpd_req_t *req)
 // DELETE /networks/:ssid
 static esp_err_t handler_delete_network(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
-    // Extract SSID from URI
-    char ssid[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(ssid, last_slash + 1, sizeof(ssid) - 1);
-    }
+    // Extract and URL-decode SSID from URI
+    char ssid[sizeof(((wifi_network_t *)0)->ssid)] = {0};
+    wifi_mgr_sm_uri_last_segment(ssid, sizeof(ssid), req->uri);
     
     if (!ssid[0]) {
         return send_error(req, 400, "Missing ssid");
@@ -320,17 +342,13 @@ static esp_err_t handler_delete_network(httpd_req_t *req)
 // PUT /networks/:ssid - Update network (password, priority)
 static esp_err_t handler_put_network(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
-    // Extract SSID from URI
-    char ssid[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(ssid, last_slash + 1, sizeof(ssid) - 1);
-    }
+    // Extract and URL-decode SSID from URI
+    char ssid[sizeof(((wifi_network_t *)0)->ssid)] = {0};
+    wifi_mgr_sm_uri_last_segment(ssid, sizeof(ssid), req->uri);
     
     if (!ssid[0]) {
         return send_error(req, 400, "Missing ssid");
@@ -341,22 +359,16 @@ static esp_err_t handler_put_network(httpd_req_t *req)
         return send_error(req, 400, "Invalid JSON");
     }
     
-    wifi_network_t network = {0};
-    strncpy(network.ssid, ssid, sizeof(network.ssid) - 1);
-    
     cJSON *password = cJSON_GetObjectItem(json, "password");
     cJSON *priority = cJSON_GetObjectItem(json, "priority");
-    
-    if (cJSON_IsString(password)) {
-        strncpy(network.password, password->valuestring, sizeof(network.password) - 1);
-    }
-    if (cJSON_IsNumber(priority)) {
-        network.priority = (uint8_t)priority->valueint;
-    }
-    
+
+    // Partial update: omitted fields keep their saved values
+    esp_err_t ret = wifi_mgr_network_upsert(ssid,
+                                            cJSON_IsString(password) ? password->valuestring : NULL,
+                                            cJSON_IsNumber(priority) ? priority->valueint : -1,
+                                            false);
     cJSON_Delete(json);
-    
-    esp_err_t ret = wifi_manager_update_network(&network);
+
     if (ret == ESP_ERR_NOT_FOUND) {
         return send_error(req, 404, "Not found");
     }
@@ -370,8 +382,8 @@ static esp_err_t handler_put_network(httpd_req_t *req)
 // POST /connect
 static esp_err_t handler_post_connect(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     if (req->content_len > 0) {
@@ -379,8 +391,11 @@ static esp_err_t handler_post_connect(httpd_req_t *req)
         if (json) {
             cJSON *ssid_item = cJSON_GetObjectItem(json, "ssid");
             if (cJSON_IsString(ssid_item)) {
-                wifi_manager_connect(ssid_item->valuestring);
+                esp_err_t ret = wifi_manager_connect(ssid_item->valuestring);
                 cJSON_Delete(json);
+                if (ret == ESP_ERR_NOT_FOUND) {
+                    return send_error(req, 404, "Network not saved");
+                }
                 return send_ok(req);
             }
             cJSON_Delete(json);
@@ -394,8 +409,8 @@ static esp_err_t handler_post_connect(httpd_req_t *req)
 // POST /disconnect
 static esp_err_t handler_post_disconnect(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_manager_disconnect();
@@ -405,8 +420,8 @@ static esp_err_t handler_post_disconnect(httpd_req_t *req)
 // GET /ap/status
 static esp_err_t handler_get_ap_status(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_ap_status_t status;
@@ -435,8 +450,8 @@ static esp_err_t handler_get_ap_status(httpd_req_t *req)
 // GET /ap/config
 static esp_err_t handler_get_ap_config(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_mgr_ap_config_t config;
@@ -462,8 +477,8 @@ static esp_err_t handler_get_ap_config(httpd_req_t *req)
 // PUT /ap/config
 static esp_err_t handler_put_ap_config(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     cJSON *json = read_json_body(req);
@@ -515,8 +530,8 @@ static esp_err_t handler_put_ap_config(httpd_req_t *req)
 // POST /ap/start
 static esp_err_t handler_post_ap_start(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_mgr_ap_config_t *config = NULL;
@@ -546,8 +561,8 @@ static esp_err_t handler_post_ap_start(httpd_req_t *req)
 // POST /ap/stop
 static esp_err_t handler_post_ap_stop(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_manager_stop_ap();
@@ -557,8 +572,8 @@ static esp_err_t handler_post_ap_stop(httpd_req_t *req)
 // GET /vars
 static esp_err_t handler_get_vars(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
     wifi_mgr_lock();
@@ -583,17 +598,13 @@ static esp_err_t handler_get_vars(httpd_req_t *req)
 // PUT /vars/:key
 static esp_err_t handler_put_var(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
     
-    // Extract key from URI
-    char key[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(key, last_slash + 1, sizeof(key) - 1);
-    }
+    // Extract and URL-decode key from URI
+    char key[sizeof(((wifi_var_t *)0)->key)] = {0};
+    wifi_mgr_sm_uri_last_segment(key, sizeof(key), req->uri);
     
     if (!key[0]) {
         return send_error(req, 400, "Missing key");
@@ -609,27 +620,30 @@ static esp_err_t handler_put_var(httpd_req_t *req)
         cJSON_Delete(json);
         return send_error(req, 400, "Missing value");
     }
-    
-    wifi_manager_set_var(key, value->valuestring);
+
+    esp_err_t set_ret = wifi_manager_set_var(key, value->valuestring);
     cJSON_Delete(json);
-    
+
+    if (set_ret == ESP_ERR_NO_MEM) {
+        return send_error(req, 400, "Too many variables");
+    }
+    if (set_ret != ESP_OK) {
+        return send_error(req, 400, "var_invalid");
+    }
+
     return send_ok(req);
 }
 
 // DELETE /vars/:key
 static esp_err_t handler_delete_var(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
 
-    // Extract key from URI
-    char key[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(key, last_slash + 1, sizeof(key) - 1);
-    }
+    // Extract and URL-decode key from URI
+    char key[sizeof(((wifi_var_t *)0)->key)] = {0};
+    wifi_mgr_sm_uri_last_segment(key, sizeof(key), req->uri);
 
     if (!key[0]) {
         return send_error(req, 400, "Missing key");
@@ -646,8 +660,8 @@ static esp_err_t handler_delete_var(httpd_req_t *req)
 // POST /factory_reset
 static esp_err_t handler_post_factory_reset(httpd_req_t *req)
 {
-    if (!check_auth(req)) {
-        return send_error(req, 401, "Unauthorized");
+    if (!check_api_access(req)) {
+        return ESP_FAIL;
     }
 
     esp_err_t ret = wifi_manager_factory_reset();
@@ -662,6 +676,7 @@ static esp_err_t handler_post_factory_reset(httpd_req_t *req)
 // Simple Fallback Page (when Web UI not enabled)
 // =============================================================================
 
+#ifndef CONFIG_WIFI_MGR_ENABLE_WEBUI
 static const char *simple_page_html =
     "<!DOCTYPE html><html><head>"
     "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -718,9 +733,9 @@ static esp_err_t handler_simple_page(httpd_req_t *req)
 {
     add_cors_headers(req);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, simple_page_html, strlen(simple_page_html));
-    return ESP_OK;
+    return httpd_resp_send(req, simple_page_html, strlen(simple_page_html));
 }
+#endif // !CONFIG_WIFI_MGR_ENABLE_WEBUI
 
 // =============================================================================
 // Captive Portal
@@ -729,6 +744,7 @@ static esp_err_t handler_simple_page(httpd_req_t *req)
 // Captive portal detection paths
 static const char *captive_detect_paths[] = {
     "/generate_204",        // Android
+    "/redirect",            // Windows (from #21)
     "/gen_204",             // Android alt
     "/hotspot-detect.html", // iOS/macOS
     "/library/test/success.html", // iOS
@@ -739,27 +755,107 @@ static const char *captive_detect_paths[] = {
     NULL
 };
 
+esp_err_t wifi_mgr_http_captive_redirect(httpd_req_t *req)
+{
+    char redirect_url[32];
+    snprintf(redirect_url, sizeof(redirect_url), "http://%s/",
+             g_wifi_mgr->ap_config.ip[0] ? g_wifi_mgr->ap_config.ip : CONFIG_WIFI_MGR_AP_IP);
+
+    // 302 to the portal root triggers the OS "sign in to network" popup
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", redirect_url);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    ESP_LOGD(TAG, "Captive redirect: %s -> %s", req->uri, redirect_url);
+    return httpd_resp_send(req, NULL, 0);
+}
+
+bool wifi_mgr_http_is_captive_client(httpd_req_t *req)
+{
+    if (!g_wifi_mgr || !g_wifi_mgr->ap_active || !g_wifi_mgr->config.enable_captive_portal) {
+        return false;
+    }
+    // Only redirect requests that arrived on the SoftAP interface; clients on
+    // the STA side (LAN) should get normal 404s while the AP happens to be up.
+    struct sockaddr_storage local;
+    socklen_t len = sizeof(local);
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&local, &len) != 0) {
+        return true;
+    }
+    esp_netif_ip_info_t ap_ip;
+    if (esp_netif_get_ip_info(g_wifi_mgr->ap_netif, &ap_ip) != ESP_OK) {
+        return true;
+    }
+    if (local.ss_family == AF_INET) {
+        return ((struct sockaddr_in *)&local)->sin_addr.s_addr == ap_ip.ip.addr;
+    }
+#if CONFIG_LWIP_IPV6
+    if (local.ss_family == AF_INET6) {
+        // IPv4-mapped IPv6 address (httpd listens on an IPv6 socket by default)
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&local;
+        const uint32_t *w = (const uint32_t *)&in6->sin6_addr;
+        return w[0] == 0 && w[1] == 0 && w[2] == htonl(0xFFFF) && w[3] == ap_ip.ip.addr;
+    }
+#endif
+    return true;
+}
+
 /**
  * @brief Captive portal detection handler - triggers OS popup
  */
 static esp_err_t handler_captive_detect(httpd_req_t *req)
 {
-    // Get AP IP for redirect
-    char redirect_url[64];
-    if (g_wifi_mgr->ap_config.ip[0]) {
-        snprintf(redirect_url, sizeof(redirect_url), "http://%s/", g_wifi_mgr->ap_config.ip);
-    } else {
-        snprintf(redirect_url, sizeof(redirect_url), "http://192.168.4.1/");
+    return wifi_mgr_http_captive_redirect(req);
+}
+
+/**
+ * @brief 404 handler: while the AP is up, send unknown paths to the portal
+ *
+ * Covers OS probes not in captive_detect_paths. Only installed when we own
+ * the httpd instance, so an application's own 404 handler is never replaced.
+ */
+static esp_err_t handler_not_found(httpd_req_t *req, httpd_err_code_t err)
+{
+    if (wifi_mgr_http_is_captive_client(req)) {
+        return wifi_mgr_http_captive_redirect(req);
     }
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
+    return ESP_FAIL;
+}
 
-    add_cors_headers(req);
+// =============================================================================
+// Handler Registry
+// =============================================================================
+//
+// Every handler we register is recorded so deinit can unregister exactly
+// that set from an application-owned httpd (#6), including handlers added
+// by the Web UI module.
 
-    // Return 302 redirect to trigger captive portal popup
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", redirect_url);
-    httpd_resp_send(req, NULL, 0);
+#define WIFI_MGR_MAX_REGISTERED_URIS 48
 
-    ESP_LOGD(TAG, "Captive detect: %s -> %s", req->uri, redirect_url);
+static struct {
+    const char *uri;        // must point to storage that outlives registration
+    httpd_method_t method;
+} s_registered[WIFI_MGR_MAX_REGISTERED_URIS];
+static size_t s_registered_count;
+
+esp_err_t wifi_mgr_http_register(const httpd_uri_t *uri)
+{
+    if (!g_wifi_mgr || !g_wifi_mgr->httpd || !uri) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t ret = httpd_register_uri_handler(g_wifi_mgr->httpd, uri);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to register %s (%d): %s%s", uri->uri, uri->method, esp_err_to_name(ret),
+                 ret == ESP_ERR_HTTPD_HANDLERS_FULL ? " - increase max_uri_handlers" : "");
+        return ret;
+    }
+    if (s_registered_count < WIFI_MGR_MAX_REGISTERED_URIS) {
+        s_registered[s_registered_count].uri = uri->uri;
+        s_registered[s_registered_count].method = uri->method;
+        s_registered_count++;
+    } else {
+        ESP_LOGW(TAG, "Handler registry full, %s will not be unregistered on deinit", uri->uri);
+    }
     return ESP_OK;
 }
 
@@ -792,11 +888,20 @@ esp_err_t wifi_mgr_http_init(void)
 
     ESP_LOGI(TAG, "Initializing HTTP interface at %s", base);
 
+#if CONFIG_HTTPD_MAX_REQ_HDR_LEN < 1024
+    if (g_wifi_mgr->config.enable_captive_portal) {
+        // Recent Android/Chrome probes send long headers; with the 512-byte
+        // default httpd answers 431 and the captive portal never opens (#21).
+        ESP_LOGW(TAG, "CONFIG_HTTPD_MAX_REQ_HDR_LEN=%d is low for captive portal clients, "
+                      "1024 or more is recommended", CONFIG_HTTPD_MAX_REQ_HDR_LEN);
+    }
+#endif
+
     // Create httpd if not provided
     if (!g_wifi_mgr->httpd) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.uri_match_fn = httpd_uri_match_wildcard;
-        config.max_uri_handlers = 32;  // API(18) + WebUI(3) + Captive(8) + reserve
+        config.max_uri_handlers = WIFI_MGR_HTTP_MAX_HANDLERS;  // API(18) + captive(9) + Web UI(3-4) + reserve
 
         esp_err_t ret = httpd_start(&g_wifi_mgr->httpd, &config);
         if (ret != ESP_OK) {
@@ -805,6 +910,12 @@ esp_err_t wifi_mgr_http_init(void)
         }
         g_wifi_mgr->httpd_owned = true;
         ESP_LOGI(TAG, "HTTP server started");
+
+        if (g_wifi_mgr->config.enable_captive_portal) {
+            httpd_register_err_handler(g_wifi_mgr->httpd, HTTPD_404_NOT_FOUND, handler_not_found);
+        }
+    } else {
+        g_wifi_mgr->httpd_owned = false;
     }
     
     // Register handlers with static URI strings
@@ -812,87 +923,78 @@ esp_err_t wifi_mgr_http_init(void)
     // Status
     snprintf(uri_status, sizeof(uri_status), "%s/status", base);
     httpd_uri_t status_uri = { .uri = uri_status, .method = HTTP_GET, .handler = handler_get_status };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &status_uri);
+    wifi_mgr_http_register(&status_uri);
 
     // Scan
     snprintf(uri_scan, sizeof(uri_scan), "%s/scan", base);
     httpd_uri_t scan_uri = { .uri = uri_scan, .method = HTTP_GET, .handler = handler_get_scan };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &scan_uri);
+    wifi_mgr_http_register(&scan_uri);
 
     // Networks
     snprintf(uri_networks, sizeof(uri_networks), "%s/networks", base);
     httpd_uri_t networks_get_uri = { .uri = uri_networks, .method = HTTP_GET, .handler = handler_get_networks };
     httpd_uri_t networks_post_uri = { .uri = uri_networks, .method = HTTP_POST, .handler = handler_post_networks };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &networks_get_uri);
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &networks_post_uri);
+    wifi_mgr_http_register(&networks_get_uri);
+    wifi_mgr_http_register(&networks_post_uri);
 
     // Update/Delete network - wildcard
     snprintf(uri_networks_wildcard, sizeof(uri_networks_wildcard), "%s/networks/*", base);
     httpd_uri_t networks_put_uri = { .uri = uri_networks_wildcard, .method = HTTP_PUT, .handler = handler_put_network };
     httpd_uri_t networks_del_uri = { .uri = uri_networks_wildcard, .method = HTTP_DELETE, .handler = handler_delete_network };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &networks_put_uri);
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &networks_del_uri);
+    wifi_mgr_http_register(&networks_put_uri);
+    wifi_mgr_http_register(&networks_del_uri);
 
     // Connect/Disconnect
     snprintf(uri_connect, sizeof(uri_connect), "%s/connect", base);
     httpd_uri_t connect_uri = { .uri = uri_connect, .method = HTTP_POST, .handler = handler_post_connect };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &connect_uri);
+    wifi_mgr_http_register(&connect_uri);
 
     snprintf(uri_disconnect, sizeof(uri_disconnect), "%s/disconnect", base);
     httpd_uri_t disconnect_uri = { .uri = uri_disconnect, .method = HTTP_POST, .handler = handler_post_disconnect };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &disconnect_uri);
+    wifi_mgr_http_register(&disconnect_uri);
 
     // AP
     snprintf(uri_ap_status, sizeof(uri_ap_status), "%s/ap/status", base);
     httpd_uri_t ap_status_uri = { .uri = uri_ap_status, .method = HTTP_GET, .handler = handler_get_ap_status };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &ap_status_uri);
+    wifi_mgr_http_register(&ap_status_uri);
 
     snprintf(uri_ap_config, sizeof(uri_ap_config), "%s/ap/config", base);
     httpd_uri_t ap_config_get_uri = { .uri = uri_ap_config, .method = HTTP_GET, .handler = handler_get_ap_config };
     httpd_uri_t ap_config_put_uri = { .uri = uri_ap_config, .method = HTTP_PUT, .handler = handler_put_ap_config };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &ap_config_get_uri);
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &ap_config_put_uri);
+    wifi_mgr_http_register(&ap_config_get_uri);
+    wifi_mgr_http_register(&ap_config_put_uri);
 
     snprintf(uri_ap_start, sizeof(uri_ap_start), "%s/ap/start", base);
     httpd_uri_t ap_start_uri = { .uri = uri_ap_start, .method = HTTP_POST, .handler = handler_post_ap_start };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &ap_start_uri);
+    wifi_mgr_http_register(&ap_start_uri);
 
     snprintf(uri_ap_stop, sizeof(uri_ap_stop), "%s/ap/stop", base);
     httpd_uri_t ap_stop_uri = { .uri = uri_ap_stop, .method = HTTP_POST, .handler = handler_post_ap_stop };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &ap_stop_uri);
+    wifi_mgr_http_register(&ap_stop_uri);
 
     // Vars
     snprintf(uri_vars, sizeof(uri_vars), "%s/vars", base);
     httpd_uri_t vars_uri = { .uri = uri_vars, .method = HTTP_GET, .handler = handler_get_vars };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &vars_uri);
+    wifi_mgr_http_register(&vars_uri);
 
     snprintf(uri_vars_wildcard, sizeof(uri_vars_wildcard), "%s/vars/*", base);
     httpd_uri_t vars_put_uri = { .uri = uri_vars_wildcard, .method = HTTP_PUT, .handler = handler_put_var };
     httpd_uri_t vars_del_uri = { .uri = uri_vars_wildcard, .method = HTTP_DELETE, .handler = handler_delete_var };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &vars_put_uri);
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &vars_del_uri);
+    wifi_mgr_http_register(&vars_put_uri);
+    wifi_mgr_http_register(&vars_del_uri);
 
     // Factory reset
     snprintf(uri_factory_reset, sizeof(uri_factory_reset), "%s/factory_reset", base);
     httpd_uri_t factory_reset_uri = { .uri = uri_factory_reset, .method = HTTP_POST, .handler = handler_post_factory_reset };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &factory_reset_uri);
+    wifi_mgr_http_register(&factory_reset_uri);
 
     // OPTIONS handler for CORS preflight (catch-all)
     snprintf(uri_options_wildcard, sizeof(uri_options_wildcard), "%s/*", base);
     httpd_uri_t options_uri = { .uri = uri_options_wildcard, .method = HTTP_OPTIONS, .handler = handler_options };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &options_uri);
+    wifi_mgr_http_register(&options_uri);
 
-    // Initialize Web UI if enabled, otherwise use simple fallback page
-#ifdef CONFIG_WIFI_MGR_ENABLE_WEBUI
-    wifi_mgr_webui_init(g_wifi_mgr->httpd);
-#else
-    // Simple fallback page at root when Web UI not enabled
-    httpd_uri_t simple_uri = { .uri = "/", .method = HTTP_GET, .handler = handler_simple_page };
-    httpd_register_uri_handler(g_wifi_mgr->httpd, &simple_uri);
-    ESP_LOGI(TAG, "Simple setup page registered at /");
-#endif
-
-    // Captive portal detection handlers (for specific OS detection paths)
+    // Captive portal detection handlers - register BEFORE wildcard handlers
+    // so they take priority and aren't shadowed by "/*" wildcard matching
     if (g_wifi_mgr->config.enable_captive_portal) {
         for (int i = 0; captive_detect_paths[i] != NULL; i++) {
             httpd_uri_t captive_uri = {
@@ -900,12 +1002,34 @@ esp_err_t wifi_mgr_http_init(void)
                 .method = HTTP_GET,
                 .handler = handler_captive_detect
             };
-            httpd_register_uri_handler(g_wifi_mgr->httpd, &captive_uri);
+            wifi_mgr_http_register(&captive_uri);
         }
         ESP_LOGI(TAG, "Captive portal detection enabled");
     }
 
+    // Initialize Web UI if enabled, otherwise use simple fallback page
+#ifdef CONFIG_WIFI_MGR_ENABLE_WEBUI
+    wifi_mgr_webui_init(g_wifi_mgr->httpd);
+#else
+    // Simple fallback page at root when Web UI not enabled
+    httpd_uri_t simple_uri = { .uri = "/", .method = HTTP_GET, .handler = handler_simple_page };
+    wifi_mgr_http_register(&simple_uri);
+    ESP_LOGI(TAG, "Simple setup page registered at /");
+#endif
+
     ESP_LOGI(TAG, "HTTP handlers registered");
+    return ESP_OK;
+}
+
+esp_err_t wifi_mgr_http_unregister_handlers(void)
+{
+    if (!g_wifi_mgr || !g_wifi_mgr->httpd) return ESP_ERR_INVALID_STATE;
+
+    for (size_t i = 0; i < s_registered_count; i++) {
+        httpd_unregister_uri_handler(g_wifi_mgr->httpd, s_registered[i].uri, s_registered[i].method);
+    }
+    ESP_LOGI(TAG, "%zu HTTP handlers unregistered", s_registered_count);
+    s_registered_count = 0;
     return ESP_OK;
 }
 
@@ -913,10 +1037,18 @@ esp_err_t wifi_mgr_http_deinit(void)
 {
     if (!g_wifi_mgr) return ESP_ERR_INVALID_STATE;
     
-    if (g_wifi_mgr->httpd && g_wifi_mgr->httpd_owned) {
-        httpd_stop(g_wifi_mgr->httpd);
-        g_wifi_mgr->httpd = NULL;
-        g_wifi_mgr->httpd_owned = false;
+    if (g_wifi_mgr->httpd) {
+        if(g_wifi_mgr->httpd_owned) {
+            // Stop and delete httpd if we created (own) it
+            httpd_stop(g_wifi_mgr->httpd);
+            g_wifi_mgr->httpd = NULL;
+            g_wifi_mgr->httpd_owned = false;
+            s_registered_count = 0;
+            ESP_LOGI(TAG, "Owned HTTP server stopped");
+        } else {
+            // Just unregister handlers if httpd not owned
+            wifi_mgr_http_unregister_handlers();
+        }
     }
     
     return ESP_OK;

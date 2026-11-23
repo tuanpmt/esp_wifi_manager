@@ -130,6 +130,9 @@ void app_main(void)
 | [with_webui](examples/with_webui/) | Embedded Web UI (no external files needed) |
 | [with_webui_customize](examples/with_webui_customize/) | Custom frontend from LittleFS |
 | [with_ble](examples/with_ble/) | BLE GATT interface for smartphone/Python CLI |
+| [with_ble_deinit](examples/with_ble_deinit/) | NimBLE, app-owned stack kept running after WiFi Manager deinit |
+
+> Upgrading from 1.x? See [CHANGELOG.md](CHANGELOG.md#migrating-from-1x) for breaking changes.
 
 ## Configuration
 
@@ -152,6 +155,16 @@ Configure via `idf.py menuconfig` → WiFi Manager:
 | `WIFI_MGR_WEBUI_CUSTOM_PATH` | "" | Custom Web UI path (LittleFS/SPIFFS) |
 | `WIFI_MGR_ENABLE_BLE` | n | Enable BLE GATT interface |
 | `WIFI_MGR_BLE_DEVICE_NAME` | "ESP32-WiFi-{id}" | BLE device name (supports {id}) |
+| `WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM` | n | Bluedroid: release Classic BT memory (saves RAM on ESP32, disables Classic BT until reboot) |
+| `WIFI_MGR_MAX_SCAN_RESULTS` | 20 | Max scan results returned by REST/BLE/CLI |
+| `WIFI_MGR_HTTP_MAX_CONTENT_LEN` | 2048 | Max HTTP request body (bytes) |
+| `WIFI_MGR_HTTP_MAX_URI_HANDLERS` | 40 | `max_uri_handlers` for the httpd created by WiFi Manager |
+| `WIFI_MGR_TASK_STACK_SIZE` | 4096 | Manager and DNS task stack size |
+| `WIFI_MGR_TASK_PRIORITY` | 5 | Manager and DNS task priority |
+
+All options also have built-in defaults, so the component can be used without running menuconfig.
+
+**Recommended for captive portal:** `CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024`. Recent Android/Chrome probes send headers larger than the 512-byte default; the server then answers `431` and the portal popup never opens. WiFi Manager logs a warning when the value is lower.
 
 ### Runtime Configuration
 
@@ -183,6 +196,10 @@ wifi_manager_config_t config = {
     .enable_captive_portal = true,
     .stop_ap_on_connect = true,
 
+    // Optional: validate variables before they are saved (any interface)
+    .on_before_var_set = my_var_validator,   // return ESP_OK to accept
+    .var_validator_ctx = NULL,
+
     // HTTP interface
     .http = {
         .enable = true,
@@ -190,6 +207,10 @@ wifi_manager_config_t config = {
         .enable_auth = true,
         .auth_username = "admin",
         .auth_password = "secret",
+        // Optional: runs before every API handler (after CORS, before auth);
+        // return non-ESP_OK to reject with 403
+        .pre_request_hook = my_api_hook,
+        .hook_ctx = NULL,
     },
 
     // mDNS (supports {id} placeholder)
@@ -213,7 +234,9 @@ wifi_manager_init(&config);
 ```c
 // Initialization
 esp_err_t wifi_manager_init(const wifi_manager_config_t *config);
-esp_err_t wifi_manager_deinit(void);
+// deinit_wifi=false keeps the STA connection (and netifs) alive and only
+// tears down the manager, HTTP handlers, BLE service and mDNS
+esp_err_t wifi_manager_deinit(bool deinit_wifi);
 
 // Status
 bool wifi_manager_is_connected(void);
@@ -226,7 +249,7 @@ esp_err_t wifi_manager_connect(const char *ssid);  // NULL for auto-connect
 esp_err_t wifi_manager_disconnect(void);
 esp_err_t wifi_manager_scan(wifi_scan_result_t *results, size_t max, size_t *count);
 
-// Network management
+// Network management (removing the connected network disconnects from it)
 esp_err_t wifi_manager_add_network(const wifi_network_t *network);
 esp_err_t wifi_manager_update_network(const wifi_network_t *network);
 esp_err_t wifi_manager_remove_network(const char *ssid);
@@ -288,11 +311,74 @@ Enable with `CONFIG_WIFI_MGR_ENABLE_CLI=y`:
 
 ## BLE GATT Interface
 
-Enable with `CONFIG_WIFI_MGR_ENABLE_BLE=y`. Requires Bluetooth enabled in sdkconfig:
+Enable with `CONFIG_WIFI_MGR_ENABLE_BLE=y`. Both Bluedroid and NimBLE host stacks are supported. Requires Bluetooth enabled in sdkconfig:
+
+**Bluedroid** (~100KB flash / ~40KB RAM):
 
 ```kconfig
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
+```
+
+**NimBLE** (~50KB flash / ~20KB RAM):
+
+```kconfig
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+```
+
+
+The device advertises the WiFi Service UUID (`0xFFE0`), allowing clients to scan and filter by service UUID — the standard BLE discovery pattern. The device name (configurable via `CONFIG_WIFI_MGR_BLE_DEVICE_NAME`) is also included in the advertising data for further filtering.
+
+### Stack Ownership & Deinitialization
+
+The BLE interface supports two modes of operation depending on whether the application manages the BLE stack independently:
+
+| Mode | Init behavior | Deinit behavior | Use case |
+|------|---------------|-----------------|----------|
+| **Owns the stack** (default) | Initializes BLE host stack + registers GATT service | Tears down everything (service, advertising, host stack, controller) | App doesn't use BLE for anything else |
+| **Service only** | Detects host stack already running, registers GATT service only | Unregisters service and stops advertising, leaves host stack running | App manages the BLE lifecycle |
+
+> **Experimental:** service-only mode has known limitations that still need hardware validation: on NimBLE the service is added after the GATT server has started and deinit calls `ble_gatts_reset()` (which also removes the application's services); on Bluedroid WiFi Manager registers its own GAP/GATTS callbacks, which replaces the application's. Prefer letting WiFi Manager own the stack unless you can test your exact setup.
+
+The mode is detected automatically: if the BLE host stack is already initialized when `wifi_manager_init()` is called, the WiFi Manager registers only its GATT service and leaves the stack alone on deinit. This mirrors the HTTP interface's shared server pattern — if you pass an existing `httpd_handle_t`, the HTTP handlers are unregistered on deinit without stopping the server.
+
+**NimBLE:**
+
+```c
+// App-owned BLE stack: init NimBLE before WiFi Manager
+nimble_port_init();
+nimble_port_freertos_init(nimble_host_task);
+
+wifi_manager_init(&(wifi_manager_config_t){
+    .ble = { .enable = true },
+});
+
+// Later: WiFi Manager removes its GATT service but NimBLE keeps running
+wifi_manager_deinit(false);
+
+// App can continue using BLE for its own services
+```
+
+**Bluedroid:**
+
+```c
+// App-owned BLE stack: init Bluedroid before WiFi Manager
+esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+esp_bt_controller_init(&bt_cfg);
+esp_bt_controller_enable(ESP_BT_MODE_BLE);
+esp_bluedroid_init();
+esp_bluedroid_enable();
+
+wifi_manager_init(&(wifi_manager_config_t){
+    .ble = { .enable = true },
+});
+
+// Later: WiFi Manager unregisters its GATT app but Bluedroid keeps running
+wifi_manager_deinit(false);
+
+// App can continue using BLE for its own services
 ```
 
 ### Service & Characteristics
@@ -306,23 +392,107 @@ CONFIG_BT_BLUEDROID_ENABLED=y
 
 ### Commands
 
-Send JSON to Command characteristic (0xFFE2):
+Send JSON to the Command characteristic (0xFFE2). Parameters are passed in a `"params"` object. Responses are sent as notifications on the Response characteristic (0xFFE3). Large responses are automatically chunked across multiple notifications.
+
+| Command          | Params | Description |
+|------------------|--------|-------------|
+| `get_status`     | (none) | Get connection status |
+| `scan`           | (none) | Scan available networks |
+| `list_networks`  | (none) | List saved networks |
+| `add_network`    | `ssid`, `password`?, `priority`? | Add new network |
+| `update_network` | `ssid`, `password`?, `priority`? | Update saved network |
+| `del_network`    | `ssid` | Remove network |
+| `connect`        | `ssid`? | Connect (auto or specific SSID) |
+| `disconnect`     | (none) | Disconnect |
+| `get_ap_status`  | (none) | Get AP status |
+| `start_ap`       | `ssid`?, `password`? | Start SoftAP |
+| `stop_ap`        | (none) | Stop SoftAP |
+| `get_var`        | `key` | Get variable |
+| `set_var`        | `key`, `value` | Set variable |
+| `list_vars`      | (none) | List all variables |
+| `del_var`        | `key` | Delete variable |
+| `factory_reset`  | (none) | Factory reset |
+
+### Example Commands
 
 ```json
 {"cmd": "get_status"}
 {"cmd": "scan"}
 {"cmd": "list_networks"}
-{"cmd": "add_network", "ssid": "MyWiFi", "pass": "secret", "prio": 10}
-{"cmd": "del_network", "ssid": "MyWiFi"}
-{"cmd": "connect"}
-{"cmd": "connect", "ssid": "MyWiFi"}
-{"cmd": "disconnect"}
-{"cmd": "get_ap_status"}
-{"cmd": "start_ap"}
-{"cmd": "stop_ap"}
-{"cmd": "get_var", "key": "device_name"}
-{"cmd": "set_var", "key": "device_name", "val": "My ESP32"}
+{"cmd": "add_network", "params": {"ssid": "MyWiFi", "password": "secret", "priority": 10}}
+{"cmd": "update_network", "params": {"ssid": "MyWiFi", "password": "newpass", "priority": 5}}
+{"cmd": "del_network", "params": {"ssid": "MyWiFi"}}
+{"cmd": "connect", "params": {"ssid": "MyWiFi"}}
+{"cmd": "get_var", "params": {"key": "device_name"}}
+{"cmd": "set_var", "params": {"key": "device_name", "value": "My ESP32"}}
+{"cmd": "list_vars"}
+{"cmd": "del_var", "params": {"key": "device_name"}}
 {"cmd": "factory_reset"}
+```
+
+### Response Format
+
+Successful responses:
+
+```json
+{"status": "ok", "data": { ... }}
+```
+
+Error responses:
+
+```json
+{"status": "error", "error": "Error message"}
+```
+
+### Response Examples
+
+**get_status**
+```json
+{
+  "status": "ok",
+  "data": {
+    "state": "connected",
+    "ssid": "MyWiFi",
+    "rssi": -65,
+    "quality": 70,
+    "ip": "192.168.1.100",
+    "channel": 6,
+    "netmask": "255.255.255.0",
+    "gateway": "192.168.1.1",
+    "dns": "192.168.1.1",
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "hostname": "esp32-aabbcc",
+    "uptime_ms": 123456,
+    "ap_active": false
+  }
+}
+```
+
+**get_ap_status**
+```json
+{
+  "status": "ok",
+  "data": {
+    "active": true,
+    "ssid": "ESP32-AABBCC",
+    "ip": "192.168.4.1",
+    "channel": 1,
+    "sta_count": 2
+  }
+}
+```
+
+**list_vars**
+```json
+{
+  "status": "ok",
+  "data": {
+    "vars": [
+      {"key": "server_url", "value": "https://api.example.com"},
+      {"key": "device_name", "value": "My ESP32"}
+    ]
+  }
+}
 ```
 
 ### Python CLI Client
@@ -331,20 +501,45 @@ Send JSON to Command characteristic (0xFFE2):
 cd tools/wifi_ble_cli
 pip install -r requirements.txt
 
-# Scan for devices
+# Global options: --device/-d (MAC address), --name/-n (name prefix, default "ESP32-WiFi")
+python wifi_ble_cli.py --name "ESP32-WiFi" <command>
+
+# Scan for BLE devices
 python wifi_ble_cli.py devices
 
-# Get status
+# Get WiFi status
 python wifi_ble_cli.py status
 
-# Add network
-python wifi_ble_cli.py add "MyWiFi" "password123"
-
-# Scan networks
+# Scan WiFi networks
 python wifi_ble_cli.py scan
 
-# Connect
+# List saved networks
+python wifi_ble_cli.py list
+
+# Add network (with optional priority)
+python wifi_ble_cli.py add "MyWiFi" "password123" --priority 10
+
+# Delete a saved network
+python wifi_ble_cli.py delete "MyWiFi"
+
+# Connect (auto or specific SSID)
 python wifi_ble_cli.py connect
+python wifi_ble_cli.py connect "MyWiFi"
+
+# Disconnect
+python wifi_ble_cli.py disconnect
+
+# AP management
+python wifi_ble_cli.py ap-status
+python wifi_ble_cli.py start-ap
+python wifi_ble_cli.py stop-ap
+
+# Custom variables
+python wifi_ble_cli.py get-var device_name
+python wifi_ble_cli.py set-var device_name "My ESP32"
+
+# Factory reset (with confirmation prompt)
+python wifi_ble_cli.py factory-reset
 ```
 
 ## REST API Reference
@@ -366,8 +561,8 @@ curl -u admin:password http://192.168.4.1/api/wifi/status
 | GET | `/status` | Get connection status |
 | GET | `/scan` | Scan available networks |
 | GET | `/networks` | List saved networks |
-| POST | `/networks` | Add new network |
-| PUT | `/networks/:ssid` | Update network |
+| POST | `/networks` | Add or update network (upsert; omitted fields keep saved values) |
+| PUT | `/networks/:ssid` | Update network (partial) |
 | DELETE | `/networks/:ssid` | Remove network |
 | POST | `/connect` | Connect (auto or specific SSID) |
 | POST | `/disconnect` | Disconnect |
@@ -380,6 +575,8 @@ curl -u admin:password http://192.168.4.1/api/wifi/status
 | PUT | `/vars/:key` | Set variable |
 | DELETE | `/vars/:key` | Delete variable |
 | POST | `/factory_reset` | Factory reset |
+
+`:ssid` and `:key` are URL-encoded path segments (e.g. `My%20WiFi`). Hidden networks are not listed by `/scan`; add them with `POST /networks` using the exact SSID and connect as usual.
 
 ### Example Requests
 
@@ -469,7 +666,8 @@ curl -X PUT http://192.168.4.1/api/wifi/vars/device_name \
 |-----------|-------------|
 | 400 | Bad Request - Invalid JSON, missing field |
 | 401 | Unauthorized - Auth required |
-| 404 | Not Found - Network/Variable does not exist |
+| 403 | Forbidden - Rejected by `pre_request_hook` |
+| 404 | Not Found - Network/Variable does not exist, or `/connect` to an unsaved SSID |
 | 500 | Internal Error - Operation failed |
 
 ## Connection Flow
@@ -486,9 +684,14 @@ Auto-connect logic:
    b. Exponential backoff between retries
    c. If success → done
    d. If fail → try next network
-3. If all fail and captive_portal enabled → start AP
+3. If all fail and captive_portal enabled → start AP,
+   otherwise keep retrying in the background with backoff (if auto_reconnect)
 4. If connected and disconnected → auto-reconnect if enabled
 ```
+
+Disconnect events from failed attempts are ignored once the sequence has
+connected to a lower-priority network, so a fallback connection is not torn
+down by stale events from the primary network.
 
 ## Captive Portal
 
@@ -501,9 +704,12 @@ When no networks are configured or all connections fail, the device starts a Sof
 
 Supported captive portal detection:
 - Android: `/generate_204`, `/gen_204`
-- iOS/macOS: `/hotspot-detect.html`
-- Windows: `/ncsi.txt`, `/connecttest.txt`
+- iOS/macOS: `/hotspot-detect.html`, `/library/test/success.html`
+- Windows: `/ncsi.txt`, `/connecttest.txt`, `/redirect`
 - Firefox: `/success.txt`, `/canonical.html`
+- Any other unknown path while the AP is active, when WiFi Manager owns the HTTP server (404 handler redirects to the portal)
+
+When you pass your own `httpd` handle, create it with `uri_match_fn = httpd_uri_match_wildcard` and enough `max_uri_handlers` (about 32); WiFi Manager unregisters exactly the handlers it registered on deinit and never replaces your 404 handler.
 
 ## Dependencies
 

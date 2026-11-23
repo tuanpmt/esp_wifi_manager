@@ -50,6 +50,37 @@ menu "WiFi Manager"
             will be replaced with last 3 bytes of MAC address.
             Example: "esp32-{id}" becomes "esp32-AABBCC"
 
+    config WIFI_MGR_MAX_SCAN_RESULTS
+        int "Maximum scan results returned"
+        default 20
+        help
+            Maximum number of WiFi scan results returned by the scan API.
+
+    config WIFI_MGR_HTTP_MAX_CONTENT_LEN
+        int "HTTP max request body size"
+        default 2048
+        help
+            Maximum allowed size (bytes) for HTTP request bodies (JSON payloads).
+
+    config WIFI_MGR_TASK_STACK_SIZE
+        int "Manager task stack size"
+        default 4096
+        help
+            Stack size (bytes) for the WiFi Manager FreeRTOS task.
+
+    config WIFI_MGR_TASK_PRIORITY
+        int "Manager task priority"
+        default 5
+        help
+            FreeRTOS priority for the WiFi Manager task and DNS server task.
+
+    config WIFI_MGR_HTTP_MAX_URI_HANDLERS
+        int "Max HTTP URI handlers"
+        default 40
+        help
+            Maximum number of URI handlers registered with the HTTP server.
+            Default accounts for API(18) + captive portal(9) + Web UI(4) + reserve.
+
     config WIFI_MGR_ENABLE_CLI
         bool "Enable CLI interface"
         default n
@@ -82,11 +113,12 @@ menu "WiFi Manager"
     config WIFI_MGR_ENABLE_BLE
         bool "Enable BLE interface"
         default n
-        depends on BT_ENABLED && BT_BLUEDROID_ENABLED
+        depends on BT_ENABLED && (BT_BLUEDROID_ENABLED || BT_NIMBLE_ENABLED)
         help
             Enable Bluetooth Low Energy interface for WiFi configuration.
             Allows configuration via BLE GATT from mobile apps or CLI tools.
             Requires Bluetooth to be enabled in menuconfig.
+            Works with both Bluedroid and NimBLE host stacks.
 
     config WIFI_MGR_BLE_DEVICE_NAME
         string "BLE device name"
@@ -95,6 +127,16 @@ menu "WiFi Manager"
         help
             BLE advertising name. Supports {id} placeholder which
             will be replaced with last 3 bytes of MAC address.
+
+    config WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM
+        bool "Release Bluetooth Classic memory (Bluedroid)"
+        default n
+        depends on WIFI_MGR_ENABLE_BLE && BT_BLUEDROID_ENABLED && SOC_BT_CLASSIC_SUPPORTED
+        help
+            Call esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT) before
+            starting the BLE stack. This frees RAM on ESP32, but Bluetooth
+            Classic can then never be used again until reboot. Leave disabled
+            if the application needs Bluetooth Classic.
 
 endmenu
 

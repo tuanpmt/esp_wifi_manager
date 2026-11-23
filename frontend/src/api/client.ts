@@ -29,7 +29,8 @@ export const api = {
   // Networks
   getNetworks: () => request<{ networks: SavedNetwork[] }>('/networks').then(r => r.networks),
 
-  addNetwork: (ssid: string, password: string, priority = 10) =>
+  // Upsert: omitted fields keep their saved values on the device
+  addNetwork: (ssid: string, password?: string, priority?: number) =>
     request('/networks', {
       method: 'POST',
       body: JSON.stringify({ ssid, password, priority }),

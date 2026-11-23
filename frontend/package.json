@@ -1,6 +1,7 @@
 {
   "name": "esp-wifi-manager-ui",
   "version": "1.0.0",
+  "type": "module",
   "description": "Modern Web UI for ESP WiFi Manager",
   "scripts": {
     "dev": "vite",

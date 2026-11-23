@@ -1,6 +1,7 @@
 set(SRCS
     "src/esp_wifi_manager.c"
     "src/esp_wifi_manager_network.c"
+    "src/esp_wifi_manager_sm.c"
     "src/esp_wifi_manager_ap.c"
     "src/esp_wifi_manager_bus.c"
     "src/esp_wifi_manager_nvs.c"
@@ -13,6 +14,7 @@ set(PRIV_REQUIRES
     esp_bus
     json
     mbedtls
+    esp_timer
 )
 
 set(EMBED_FILES)
@@ -55,7 +57,14 @@ idf_component_register(
 # This ensures Kconfig variables are properly resolved
 if(CONFIG_BT_ENABLED AND CONFIG_WIFI_MGR_ENABLE_BLE)
     idf_component_get_property(lib ${COMPONENT_NAME} COMPONENT_LIB)
+    # Shared BLE layer (command routing, JSON protocol)
     target_sources(${lib} PRIVATE "src/esp_wifi_manager_ble.c")
+    # Stack-specific backend
+    if(CONFIG_BT_BLUEDROID_ENABLED)
+        target_sources(${lib} PRIVATE "src/esp_wifi_manager_ble_bluedroid.c")
+    elseif(CONFIG_BT_NIMBLE_ENABLED)
+        target_sources(${lib} PRIVATE "src/esp_wifi_manager_ble_nimble.c")
+    endif()
     idf_component_get_property(bt_lib bt COMPONENT_LIB)
     target_link_libraries(${lib} PRIVATE ${bt_lib})
 endif()
