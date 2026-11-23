@@ -383,6 +383,15 @@ typedef struct {
 // =============================================================================
 
 /**
+ * @brief Pre-request hook callback
+ *
+ * Called before every API handler (after CORS, before auth check).
+ * Return ESP_OK to continue to the handler, ESP_FAIL to reject (sends 403).
+ * Only applies to /api/wifi/ endpoints, not static file serving.
+ */
+typedef esp_err_t (*wifi_mgr_http_hook_t)(httpd_req_t *req, void *ctx);
+
+/**
  * @brief HTTP interface configuration
  *
  * Cấu hình HTTP REST API. Có thể dùng httpd có sẵn hoặc tạo mới.
@@ -394,6 +403,8 @@ typedef struct {
     bool enable_auth;           ///< Enable Basic Auth
     const char *auth_username;  ///< Auth username, default "admin"
     const char *auth_password;  ///< Auth password, default "admin"
+    wifi_mgr_http_hook_t pre_request_hook;  ///< Optional pre-request hook for API endpoints
+    void *hook_ctx;             ///< Context passed to pre_request_hook
 } wifi_mgr_http_config_t;
 
 /**
@@ -416,6 +427,14 @@ typedef struct {
     bool enable;                ///< Enable BLE interface
     const char *device_name;    ///< BLE device name, e.g., "ESP32-WiFi-{id}", default from Kconfig
 } wifi_mgr_ble_config_t;
+
+/**
+ * @brief Variable validation callback
+ *
+ * Called before writing a variable to NVS on PUT /api/wifi/vars/:key.
+ * Return ESP_OK to accept, ESP_FAIL to reject (API returns 400 with "var_invalid").
+ */
+typedef esp_err_t (*wifi_mgr_var_validator_t)(const char *key, const char *value, void *ctx);
 
 /**
  * @brief Main WiFi Manager configuration
@@ -446,7 +465,11 @@ typedef struct {
     bool enable_captive_portal;         ///< Start AP if all networks fail
     bool stop_ap_on_connect;            ///< Stop AP when STA connected successfully
     bool start_ap_on_init;              ///< Start AP immediately on init (AP+STA mode)
-    
+
+    // Callbacks
+    wifi_mgr_var_validator_t on_before_var_set;  ///< Optional variable validation callback
+    void *var_validator_ctx;                      ///< Context passed to on_before_var_set
+
     // Interfaces
     wifi_mgr_http_config_t http;        ///< HTTP REST API config
     wifi_mgr_mdns_config_t mdns;        ///< mDNS config
