@@ -18,6 +18,9 @@ files:
     - "**/venv/**/*"
     - "**/__pycache__/**/*"
     - "test/host/test_sm"
+    - "test/host/*.dSYM/**/*"
+    - "docs/dev/**/*"
+    - "CLAUDE.md"
 
 maintainers:
   - tuanpmt
