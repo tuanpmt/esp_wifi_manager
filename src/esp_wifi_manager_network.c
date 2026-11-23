@@ -49,7 +49,7 @@ static void fill_sta_config(wifi_config_t *cfg, const wifi_network_t *net)
 
 static bool stop_requested(void)
 {
-    return (xEventGroupGetBits(g_wifi_mgr->event_group) & WIFI_STOP_BIT) != 0;
+    return (xEventGroupGetBits(g_wifi_mgr->event_group) & (WIFI_STOP_BIT | WIFI_ABORT_BIT)) != 0;
 }
 
 /**
@@ -57,9 +57,9 @@ static bool stop_requested(void)
  */
 static bool wait_or_stop(uint32_t delay_ms)
 {
-    EventBits_t bits = xEventGroupWaitBits(g_wifi_mgr->event_group, WIFI_STOP_BIT,
+    EventBits_t bits = xEventGroupWaitBits(g_wifi_mgr->event_group, WIFI_STOP_BIT | WIFI_ABORT_BIT,
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(delay_ms));
-    return (bits & WIFI_STOP_BIT) != 0;
+    return (bits & (WIFI_STOP_BIT | WIFI_ABORT_BIT)) != 0;
 }
 
 void wifi_mgr_start_connect_sequence(void)
@@ -74,6 +74,7 @@ void wifi_mgr_start_connect_sequence(void)
 
     wifi_mgr_lock();
     g_wifi_mgr->connecting = true;
+    xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_ABORT_BIT);
     sort_networks_by_priority();
     wifi_mgr_unlock();
 
@@ -109,8 +110,22 @@ void wifi_mgr_start_connect_sequence(void)
 
             if (bits & WIFI_CONNECTED_BIT) {
                 ESP_LOGI(TAG, "Connected to %s", net->ssid);
-                g_wifi_mgr->connecting = false;
+                // Do not rely on the queued STA_CONNECTED event for the state
+                g_wifi_mgr->state = WIFI_STATE_CONNECTED;
+                g_wifi_mgr->connect_time = esp_timer_get_time() / 1000;
                 g_wifi_mgr->retry_count = 0;  // Reset backoff counter on success
+                g_wifi_mgr->connecting = false;
+
+                // A link loss between CONNECTED_BIT and clearing `connecting`
+                // was swallowed as an attempt failure: catch it here.
+                wifi_ap_record_t ap_info;
+                if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+                    ESP_LOGW(TAG, "Link lost right after connecting");
+                    g_wifi_mgr->state = WIFI_STATE_DISCONNECTED;
+                    if (g_wifi_mgr->config.auto_reconnect && !g_wifi_mgr->ap_active) {
+                        wifi_mgr_schedule_reconnect();
+                    }
+                }
                 return;
             }
 
@@ -127,11 +142,21 @@ void wifi_mgr_start_connect_sequence(void)
         }
     }
 
+    EventBits_t end_bits = xEventGroupGetBits(g_wifi_mgr->event_group);
     g_wifi_mgr->connecting = false;
-    if (stop_requested()) return;
+    g_wifi_mgr->state = WIFI_STATE_DISCONNECTED;
+    if (end_bits & WIFI_STOP_BIT) return;
+    if (end_bits & WIFI_ABORT_BIT) {
+        // Interrupted by a scan: resume later instead of opening the portal
+        ESP_LOGI(TAG, "Connect sequence aborted");
+        xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_ABORT_BIT);
+        if (g_wifi_mgr->config.auto_reconnect && !g_wifi_mgr->ap_active) {
+            wifi_mgr_schedule_reconnect();
+        }
+        return;
+    }
 
     ESP_LOGW(TAG, "Failed to connect to any network");
-    g_wifi_mgr->state = WIFI_STATE_DISCONNECTED;
 
     // Start captive portal if enabled and AP not already running
     if (g_wifi_mgr->config.enable_captive_portal && !g_wifi_mgr->ap_active) {
@@ -365,10 +390,14 @@ esp_err_t wifi_manager_scan(wifi_scan_result_t *results, size_t max_count, size_
 
     ESP_LOGI(TAG, "Starting scan");
 
-    // Stop connection attempt if in progress (scan not allowed while connecting)
+    // Stop connection attempt if in progress (scan not allowed while connecting).
+    // The sequence owns `connecting`; ask it to abort instead of clearing the
+    // flag, so its remaining attempt failures stay filtered.
     if (g_wifi_mgr->connecting || g_wifi_mgr->state == WIFI_STATE_CONNECTING) {
         ESP_LOGI(TAG, "Stopping connection for scan");
-        g_wifi_mgr->connecting = false;
+        if (g_wifi_mgr->connecting) {
+            xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_ABORT_BIT);
+        }
         esp_wifi_disconnect();
         vTaskDelay(pdMS_TO_TICKS(100));  // Brief delay for disconnect
     }

@@ -241,6 +241,11 @@ static void start_advertising(void)
 
 static void ble_on_sync(void)
 {
+    // Service-only mode: let the application finish its own setup first
+    if (s_prev_sync_cb && s_prev_sync_cb != ble_on_sync) {
+        s_prev_sync_cb();
+    }
+
     // Use best available address
     int rc = ble_hs_util_ensure_addr(0);
     if (rc != 0) {

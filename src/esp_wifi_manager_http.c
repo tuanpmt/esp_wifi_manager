@@ -4,6 +4,7 @@
  */
 
 #include "esp_wifi_manager_priv.h"
+#include "lwip/sockets.h"
 #include "esp_log.h"
 #include "cJSON.h"
 #include "mbedtls/base64.h"
@@ -768,6 +769,37 @@ esp_err_t wifi_mgr_http_captive_redirect(httpd_req_t *req)
     return httpd_resp_send(req, NULL, 0);
 }
 
+bool wifi_mgr_http_is_captive_client(httpd_req_t *req)
+{
+    if (!g_wifi_mgr || !g_wifi_mgr->ap_active || !g_wifi_mgr->config.enable_captive_portal) {
+        return false;
+    }
+    // Only redirect requests that arrived on the SoftAP interface; clients on
+    // the STA side (LAN) should get normal 404s while the AP happens to be up.
+    struct sockaddr_storage local;
+    socklen_t len = sizeof(local);
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&local, &len) != 0) {
+        return true;
+    }
+    esp_netif_ip_info_t ap_ip;
+    if (esp_netif_get_ip_info(g_wifi_mgr->ap_netif, &ap_ip) != ESP_OK) {
+        return true;
+    }
+    if (local.ss_family == AF_INET) {
+        return ((struct sockaddr_in *)&local)->sin_addr.s_addr == ap_ip.ip.addr;
+    }
+#if CONFIG_LWIP_IPV6
+    if (local.ss_family == AF_INET6) {
+        // IPv4-mapped IPv6 address (httpd listens on an IPv6 socket by default)
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)&local;
+        const uint32_t *w = (const uint32_t *)&in6->sin6_addr;
+        return w[0] == 0 && w[1] == 0 && w[2] == htonl(0xFFFF) && w[3] == ap_ip.ip.addr;
+    }
+#endif
+    return true;
+}
+
 /**
  * @brief Captive portal detection handler - triggers OS popup
  */
@@ -784,7 +816,7 @@ static esp_err_t handler_captive_detect(httpd_req_t *req)
  */
 static esp_err_t handler_not_found(httpd_req_t *req, httpd_err_code_t err)
 {
-    if (g_wifi_mgr && g_wifi_mgr->ap_active && g_wifi_mgr->config.enable_captive_portal) {
+    if (wifi_mgr_http_is_captive_client(req)) {
         return wifi_mgr_http_captive_redirect(req);
     }
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);
@@ -869,7 +901,7 @@ esp_err_t wifi_mgr_http_init(void)
     if (!g_wifi_mgr->httpd) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.uri_match_fn = httpd_uri_match_wildcard;
-        config.max_uri_handlers = WIFI_MGR_HTTP_MAX_HANDLERS;  // Default 32: API(18) + WebUI(3) + Captive(8) + reserve
+        config.max_uri_handlers = WIFI_MGR_HTTP_MAX_HANDLERS;  // API(18) + captive(9) + Web UI(3-4) + reserve
 
         esp_err_t ret = httpd_start(&g_wifi_mgr->httpd, &config);
         if (ret != ESP_OK) {

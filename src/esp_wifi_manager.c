@@ -350,8 +350,11 @@ esp_err_t wifi_manager_deinit(bool deinit_wifi)
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
     if (!(bits & WIFI_TASK_DONE_BIT)) {
         ESP_LOGE(TAG, "Manager task did not stop in time");
+        // Leave the manager usable; deinit can be retried
+        xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_STOP_BIT);
         return ESP_ERR_TIMEOUT;
     }
+    wifi_mgr_cancel_reconnect();  // the task may have re-armed it before exiting
 
 #ifdef CONFIG_WIFI_MGR_ENABLE_BLE
     wifi_mgr_ble_deinit();
@@ -425,10 +428,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             // Set bit immediately to unblock connect sequence (avoid deadlock)
             xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_FAIL_BIT);
             xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_CONNECTED_BIT);
+            if (g_wifi_mgr->connecting) {
+                // Attempt failure inside the connect sequence: the sequence
+                // handles it. Queuing it would only produce a stale event for
+                // the manager task (#14) and can fill the queue so that the
+                // CONNECTED/GOT_IP events of the final success are dropped.
+                break;
+            }
             evt.type = WM_INT_EVT_STA_DISCONNECTED;
             wifi_mgr_sm_copy_str(evt.data.disconnect.ssid, sizeof(evt.data.disconnect.ssid), (const char *)event->ssid);
             evt.data.disconnect.reason = event->reason;
-            evt.data.disconnect.during_connect = g_wifi_mgr->connecting;
             wifi_mgr_send_event_data(&evt);
             break;
         }
@@ -493,12 +502,20 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
 
 static void reconnect_timer_cb(void *arg)
 {
-    wifi_mgr_send_event(WM_INT_EVT_RECONNECT);
+    if (!g_wifi_mgr || !g_wifi_mgr->queue) return;
+    wifi_mgr_event_t evt = { .type = WM_INT_EVT_RECONNECT };
+    if (xQueueSend(g_wifi_mgr->queue, &evt, 0) != pdTRUE) {
+        // Queue full: try again shortly instead of never reconnecting
+        esp_timer_start_once(g_wifi_mgr->reconnect_timer, 1000 * 1000);
+    }
 }
 
 void wifi_mgr_schedule_reconnect(void)
 {
     if (!g_wifi_mgr || !g_wifi_mgr->reconnect_timer) return;
+    if (xEventGroupGetBits(g_wifi_mgr->event_group) & WIFI_STOP_BIT) return;
+    // Idempotent: one pending reconnect at a time, backoff grows per attempt
+    if (esp_timer_is_active(g_wifi_mgr->reconnect_timer)) return;
 
     uint32_t delay = wifi_mgr_sm_backoff_ms(g_wifi_mgr->config.retry_interval_ms,
                                             g_wifi_mgr->config.retry_max_interval_ms,
@@ -507,7 +524,6 @@ void wifi_mgr_schedule_reconnect(void)
              (unsigned long)delay, g_wifi_mgr->retry_count + 1);
     g_wifi_mgr->retry_count++;
 
-    esp_timer_stop(g_wifi_mgr->reconnect_timer);  // restart if already armed
     esp_timer_start_once(g_wifi_mgr->reconnect_timer, (uint64_t)delay * 1000);
 }
 
@@ -564,7 +580,7 @@ static void wifi_mgr_task(void *arg)
                 case WM_INT_EVT_STA_DISCONNECTED: {
                     wifi_ap_record_t ap_info;
                     wifi_mgr_disc_input_t in = {
-                        .during_connect = evt.data.disconnect.during_connect || g_wifi_mgr->connecting,
+                        .during_connect = g_wifi_mgr->connecting,
                         .associated = esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK,
                         .auto_reconnect = g_wifi_mgr->config.auto_reconnect,
                         .ap_active = g_wifi_mgr->ap_active,

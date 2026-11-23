@@ -22,7 +22,7 @@ typedef enum {
 } wifi_mgr_disc_action_t;
 
 typedef struct {
-    bool during_connect;    ///< Event was raised while the connect sequence was running
+    bool during_connect;    ///< Connect sequence is running (it owns retries/fallback)
     bool associated;        ///< Station is associated at the time the event is processed
     bool auto_reconnect;    ///< config.auto_reconnect
     bool ap_active;         ///< SoftAP is running

@@ -42,11 +42,15 @@ static bool s_initialized = false;
 
 typedef struct {
     char *data;     // NUL-terminated, heap-allocated; NULL = stop request
+    bool is_reply;  // data is a ready-made response to send, not a command
 } ble_cmd_msg_t;
 
 static QueueHandle_t s_cmd_queue;
 static TaskHandle_t s_cmd_task;
 static SemaphoreHandle_t s_cmd_task_done;
+// Guards s_cmd_accepting + queue sends from BLE host callbacks against teardown
+static SemaphoreHandle_t s_cmd_lock;
+static bool s_cmd_accepting;
 
 static void handle_command(const char *json_str);
 static void send_response(const char *json_str);
@@ -475,7 +479,13 @@ static void ble_cmd_task(void *arg)
         if (!msg.data) {
             break;  // stop request
         }
-        handle_command(msg.data);
+        // All notifications go out from this task, so replies never
+        // interleave with the chunks of another response
+        if (msg.is_reply) {
+            send_response(msg.data);
+        } else {
+            handle_command(msg.data);
+        }
         free(msg.data);
     }
     xSemaphoreGive(s_cmd_task_done);
@@ -484,31 +494,48 @@ static void ble_cmd_task(void *arg)
 
 void wifi_mgr_ble_on_command(const uint8_t *data, size_t length)
 {
-    if (!s_cmd_queue || !data || length == 0) {
-        return;
-    }
-    if (length > BLE_CMD_MAX_LEN) {
-        ESP_LOGW(TAG, "Command too long (%u bytes), max %d", (unsigned)length, BLE_CMD_MAX_LEN);
-        send_response("{\"status\":\"error\",\"error\":\"Command too long\"}");
+    if (!s_cmd_lock || !data || length == 0) {
         return;
     }
 
-    ble_cmd_msg_t msg = { .data = malloc(length + 1) };
+    ble_cmd_msg_t msg = {0};
+    if (length > BLE_CMD_MAX_LEN) {
+        ESP_LOGW(TAG, "Command too long (%u bytes), max %d", (unsigned)length, BLE_CMD_MAX_LEN);
+        msg.data = strdup("{\"status\":\"error\",\"error\":\"Command too long\"}");
+        msg.is_reply = true;
+    } else {
+        msg.data = malloc(length + 1);
+        if (msg.data) {
+            memcpy(msg.data, data, length);
+            msg.data[length] = '\0';
+        }
+    }
     if (!msg.data) {
         return;
     }
-    memcpy(msg.data, data, length);
-    msg.data[length] = '\0';
 
-    if (xQueueSend(s_cmd_queue, &msg, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Command queue full, dropping command");
+    bool queued = false;
+    xSemaphoreTake(s_cmd_lock, portMAX_DELAY);
+    if (s_cmd_accepting) {
+        queued = xQueueSend(s_cmd_queue, &msg, 0) == pdTRUE;
+    }
+    xSemaphoreGive(s_cmd_lock);
+
+    if (!queued) {
+        // Busy with another command (or shutting down). Replying from here
+        // could interleave with a response being sent, so only log it.
+        ESP_LOGW(TAG, "Command dropped (busy)");
         free(msg.data);
-        send_response("{\"status\":\"error\",\"error\":\"Busy\"}");
     }
 }
 
 static esp_err_t cmd_task_start(void)
 {
+    if (!s_cmd_lock) {
+        // Created once and kept: host callbacks may race with deinit
+        s_cmd_lock = xSemaphoreCreateMutex();
+        if (!s_cmd_lock) return ESP_ERR_NO_MEM;
+    }
     s_cmd_queue = xQueueCreate(BLE_CMD_QUEUE_DEPTH, sizeof(ble_cmd_msg_t));
     s_cmd_task_done = xSemaphoreCreateBinary();
     if (!s_cmd_queue || !s_cmd_task_done ||
@@ -521,6 +548,9 @@ static esp_err_t cmd_task_start(void)
         s_cmd_task = NULL;
         return ESP_ERR_NO_MEM;
     }
+    xSemaphoreTake(s_cmd_lock, portMAX_DELAY);
+    s_cmd_accepting = true;
+    xSemaphoreGive(s_cmd_lock);
     return ESP_OK;
 }
 
@@ -532,12 +562,18 @@ static void cmd_task_stop(void)
     if (!s_cmd_task) {
         return;
     }
+    // Stop accepting first: after this no host callback touches the queue
+    xSemaphoreTake(s_cmd_lock, portMAX_DELAY);
+    s_cmd_accepting = false;
+    xSemaphoreGive(s_cmd_lock);
+
     // Drop queued commands, then ask the task to exit and wait for it
     ble_cmd_msg_t msg;
     while (xQueueReceive(s_cmd_queue, &msg, 0) == pdTRUE) {
         free(msg.data);
     }
     msg.data = NULL;
+    msg.is_reply = false;
     xQueueSend(s_cmd_queue, &msg, portMAX_DELAY);
     if (xSemaphoreTake(s_cmd_task_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
         ESP_LOGE(TAG, "BLE command task did not stop in time");
@@ -620,12 +656,12 @@ esp_err_t wifi_mgr_ble_deinit(void)
     }
     ESP_LOGI(TAG, "Deinitializing BLE interface");
 
-    // Stop command processing before the transport goes away
-    cmd_task_stop();
-    esp_err_t ret = wifi_mgr_ble_backend_deinit();
-
+    // Suppress notifications from the command in progress, stop command
+    // processing, then tear down the transport
     s_connected = false;
     s_response_notify_enabled = false;
+    cmd_task_stop();
+    esp_err_t ret = wifi_mgr_ble_backend_deinit();
     s_initialized = false;
     return ret;
 }

@@ -190,8 +190,7 @@ const char *wifi_mgr_sm_mime_type(const char *path)
     };
     if (!path) return "application/octet-stream";
     size_t len = strlen(path);
-    // "foo.js.gz" is served as foo.js with Content-Encoding: gzip
-    if (ends_with_ci(path, len, ".gz")) len -= 3;
+    if (ends_with_ci(path, len, ".gz")) return "application/gzip";
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
         if (ends_with_ci(path, len, types[i].ext)) return types[i].type;
     }

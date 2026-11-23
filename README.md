@@ -158,7 +158,7 @@ Configure via `idf.py menuconfig` → WiFi Manager:
 | `WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM` | n | Bluedroid: release Classic BT memory (saves RAM on ESP32, disables Classic BT until reboot) |
 | `WIFI_MGR_MAX_SCAN_RESULTS` | 20 | Max scan results returned by REST/BLE/CLI |
 | `WIFI_MGR_HTTP_MAX_CONTENT_LEN` | 2048 | Max HTTP request body (bytes) |
-| `WIFI_MGR_HTTP_MAX_URI_HANDLERS` | 32 | `max_uri_handlers` for the httpd created by WiFi Manager |
+| `WIFI_MGR_HTTP_MAX_URI_HANDLERS` | 40 | `max_uri_handlers` for the httpd created by WiFi Manager |
 | `WIFI_MGR_TASK_STACK_SIZE` | 4096 | Manager and DNS task stack size |
 | `WIFI_MGR_TASK_PRIORITY` | 5 | Manager and DNS task priority |
 

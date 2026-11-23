@@ -60,15 +60,24 @@ static bool serve_from_filesystem(httpd_req_t *req, const char *uri)
         strcpy(relpath, "/index.html");
     }
 
+    // A request for "x.js.gz" itself is served verbatim as application/gzip;
+    // otherwise a pre-compressed "<file>.gz" is preferred.
+    size_t rel_len = strlen(relpath);
+    bool direct_gz = rel_len > 3 && strcmp(relpath + rel_len - 3, ".gz") == 0;
+
     char fullpath[160];
-    int n = snprintf(fullpath, sizeof(fullpath), "%s%s.gz", base_path, relpath);
+    int n = snprintf(fullpath, sizeof(fullpath), "%s%s%s", base_path, relpath, direct_gz ? "" : ".gz");
     if (n < 0 || n >= (int)sizeof(fullpath)) {
         return false;
     }
 
     struct stat st;
-    bool gzipped = stat(fullpath, &st) == 0 && S_ISREG(st.st_mode);
-    if (!gzipped) {
+    bool gzipped = !direct_gz && stat(fullpath, &st) == 0 && S_ISREG(st.st_mode);
+    if (direct_gz) {
+        if (stat(fullpath, &st) != 0 || !S_ISREG(st.st_mode)) {
+            return false;
+        }
+    } else if (!gzipped) {
         fullpath[n - 3] = '\0';  // drop ".gz"
         if (stat(fullpath, &st) != 0 || !S_ISREG(st.st_mode)) {
             return false;
@@ -174,7 +183,7 @@ static esp_err_t handler_webui_wildcard(httpd_req_t *req)
     }
 
     // Unknown path: send captive clients to the portal, others get 404
-    if (g_wifi_mgr && g_wifi_mgr->ap_active && g_wifi_mgr->config.enable_captive_portal) {
+    if (wifi_mgr_http_is_captive_client(req)) {
         return wifi_mgr_http_captive_redirect(req);
     }
     httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, NULL);

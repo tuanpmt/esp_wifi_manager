@@ -22,6 +22,12 @@
 - Bluedroid no longer releases Bluetooth Classic memory by default (#11).
   Enable `CONFIG_WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM` to keep the old behavior.
 - `POST /connect` with an SSID that is not saved returns `404` instead of `200`.
+- `WIFI_MGR_EVT_DISCONNECTED` is no longer emitted for failed attempts inside
+  the connect sequence, only when an established link is lost (#14). Listen
+  for `WIFI_MGR_EVT_CONNECTING` and the final state instead.
+- In REST/BLE network requests a negative or missing `priority` keeps the
+  saved value; new networks default to priority 10.
+- `CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS` defaults to 40 (was 32).
 
 ### Added
 
@@ -62,7 +68,9 @@
   touch a BLE stack it never initialized
 - `wifi_manager_deinit()` freed the context while the manager task could still
   be inside the connect sequence
-- Auto-reconnect backoff no longer blocks the manager task
+- Auto-reconnect backoff no longer blocks the manager task, and a scan during
+  the connect sequence aborts it cleanly and resumes later
+- Captive portal redirects only apply to clients on the SoftAP interface
 - Web UI could not connect to open networks that were not saved yet
 
 ### Migrating from 1.x

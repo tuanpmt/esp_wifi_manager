@@ -77,7 +77,7 @@ extern "C" {
 #endif
 
 #ifndef CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
-#define CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS 32
+#define CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS 40
 #endif
 
 
@@ -93,7 +93,7 @@ extern "C" {
 #define WIFI_MGR_TASK_STACK_SIZE    CONFIG_WIFI_MGR_TASK_STACK_SIZE
 #define WIFI_MGR_TASK_PRIORITY      CONFIG_WIFI_MGR_TASK_PRIORITY
 #define WIFI_MGR_HTTP_MAX_HANDLERS  CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
-#define WIFI_MGR_QUEUE_SIZE         10
+#define WIFI_MGR_QUEUE_SIZE         16
 #define WIFI_MGR_DEFAULT_PRIORITY   10
 
 // Event bits (for sync waits)
@@ -102,6 +102,7 @@ extern "C" {
 #define WIFI_SCAN_DONE_BIT          BIT2
 #define WIFI_STOP_BIT               BIT3    // deinit requested, abort waits
 #define WIFI_TASK_DONE_BIT          BIT4    // manager task has exited
+#define WIFI_ABORT_BIT              BIT5    // abort the running connect sequence (e.g. scan)
 
 // =============================================================================
 // Internal Events (sent to task queue)
@@ -132,7 +133,6 @@ typedef struct {
         struct {
             char ssid[33];
             uint8_t reason;
-            bool during_connect;    // raised while the connect sequence was running
         } disconnect;
         struct {
             char ssid[33];
@@ -228,6 +228,7 @@ esp_err_t wifi_mgr_http_init(void);
 esp_err_t wifi_mgr_http_unregister_handlers(void);
 esp_err_t wifi_mgr_http_register(const httpd_uri_t *uri);
 esp_err_t wifi_mgr_http_captive_redirect(httpd_req_t *req);
+bool wifi_mgr_http_is_captive_client(httpd_req_t *req);
 esp_err_t wifi_mgr_http_deinit(void);
 
 // =============================================================================

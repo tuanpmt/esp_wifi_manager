@@ -76,10 +76,10 @@ menu "WiFi Manager"
 
     config WIFI_MGR_HTTP_MAX_URI_HANDLERS
         int "Max HTTP URI handlers"
-        default 32
+        default 40
         help
             Maximum number of URI handlers registered with the HTTP server.
-            Default accounts for API(18) + WebUI(3) + Captive(8) + reserve.
+            Default accounts for API(18) + captive portal(9) + Web UI(4) + reserve.
 
     config WIFI_MGR_ENABLE_CLI
         bool "Enable CLI interface"

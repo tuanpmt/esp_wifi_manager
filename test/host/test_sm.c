@@ -264,6 +264,7 @@ static void test_mime_matches_suffix_not_substring(void)
     EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/INDEX.HTML"), "text/html"), 0);
     EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/style.css"), "text/css"), 0);
     EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/noext"), "application/octet-stream"), 0);
+    EXPECT_EQ(strcmp(wifi_mgr_sm_mime_type("/app.js.gz"), "application/gzip"), 0);
 }
 
 int main(void)
