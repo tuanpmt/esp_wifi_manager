@@ -5,6 +5,8 @@
 
 #include "esp_wifi_manager_priv.h"
 #include "esp_log.h"
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "wifi_mgr_nvs";
@@ -20,6 +22,53 @@ static const char *TAG = "wifi_mgr_nvs";
 #define NVS_KEY_AP_CONFIG       "ap_config"
 #define NVS_KEY_AUTH_USER       "auth_user"
 #define NVS_KEY_AUTH_PASS       "auth_pass"
+
+// =============================================================================
+// v1.x -> v2 blob migration
+// =============================================================================
+//
+// v2.0 grew every SSID field from 32 to 33 bytes (room for a NUL after a
+// 32-byte SSID). Blobs written by v1.x are one byte shorter and every field
+// after the SSID is shifted; they are converted on load and re-saved.
+
+_Static_assert(offsetof(wifi_network_t, ssid) == 0 && _Alignof(wifi_network_t) == 1,
+               "wifi_network_t migration assumes a byte-aligned struct starting with ssid");
+_Static_assert(offsetof(wifi_mgr_ap_config_t, ssid) == 0 && _Alignof(wifi_mgr_ap_config_t) == 1,
+               "wifi_mgr_ap_config_t migration assumes a byte-aligned struct starting with ssid");
+
+/**
+ * @brief Read a blob that may be in the v1.x (ssid[32]) layout
+ *
+ * @param[out] migrated set to true if a legacy blob was converted
+ */
+static esp_err_t get_blob_compat(nvs_handle_t handle, const char *key,
+                                 void *out, size_t out_size, bool *migrated)
+{
+    size_t len = 0;
+    esp_err_t ret = nvs_get_blob(handle, key, NULL, &len);
+    if (ret != ESP_OK) return ret;
+
+    if (len == out_size) {
+        return nvs_get_blob(handle, key, out, &len);
+    }
+    if (len + 1 == out_size) {
+        uint8_t *legacy = malloc(len);
+        if (!legacy) return ESP_ERR_NO_MEM;
+        ret = nvs_get_blob(handle, key, legacy, &len);
+        if (ret == ESP_OK) {
+            memset(out, 0, out_size);
+            if (!wifi_mgr_sm_migrate_ssid32_blob(legacy, len, out, out_size)) {
+                ret = ESP_ERR_INVALID_SIZE;
+            } else if (migrated) {
+                *migrated = true;
+            }
+        }
+        free(legacy);
+        return ret;
+    }
+    ESP_LOGW(TAG, "Blob %s has unexpected size %zu (expected %zu), ignoring", key, len, out_size);
+    return ESP_ERR_INVALID_SIZE;
+}
 
 // =============================================================================
 // Init
@@ -65,13 +114,15 @@ esp_err_t wifi_mgr_nvs_load_networks(wifi_network_t *networks, size_t max_count,
     }
     
     size_t loaded = 0;
+    bool migrated = false;
     for (uint8_t i = 0; i < net_count && loaded < max_count; i++) {
         char key[16];
         snprintf(key, sizeof(key), NVS_KEY_NET_PREFIX "%d", i);
         
-        size_t len = sizeof(wifi_network_t);
-        ret = nvs_get_blob(handle, key, &networks[loaded], &len);
+        ret = get_blob_compat(handle, key, &networks[loaded], sizeof(wifi_network_t), &migrated);
         if (ret == ESP_OK) {
+            networks[loaded].ssid[sizeof(networks[loaded].ssid) - 1] = '\0';
+            networks[loaded].password[sizeof(networks[loaded].password) - 1] = '\0';
             loaded++;
         }
     }
@@ -79,6 +130,11 @@ esp_err_t wifi_mgr_nvs_load_networks(wifi_network_t *networks, size_t max_count,
     *count = loaded;
     nvs_close(handle);
     ESP_LOGI(TAG, "Loaded %zu networks from NVS", loaded);
+
+    if (migrated) {
+        ESP_LOGI(TAG, "Migrating saved networks to v2 format");
+        wifi_mgr_nvs_save_networks(networks, loaded);
+    }
     return ESP_OK;
 }
 
@@ -192,10 +248,14 @@ esp_err_t wifi_mgr_nvs_load_ap_config(wifi_mgr_ap_config_t *config)
     }
     if (ret != ESP_OK) return ret;
     
-    size_t len = sizeof(wifi_mgr_ap_config_t);
-    ret = nvs_get_blob(handle, NVS_KEY_AP_CONFIG, config, &len);
-    
+    bool migrated = false;
+    ret = get_blob_compat(handle, NVS_KEY_AP_CONFIG, config, sizeof(wifi_mgr_ap_config_t), &migrated);
     nvs_close(handle);
+
+    if (ret == ESP_OK && migrated) {
+        ESP_LOGI(TAG, "Migrating AP config to v2 format");
+        wifi_mgr_nvs_save_ap_config(config);
+    }
     return ret;
 }
 

@@ -299,21 +299,15 @@ static esp_err_t handler_post_networks(httpd_req_t *req)
         return send_error(req, 400, "Missing ssid");
     }
     
-    wifi_network_t network = {0};
-    strncpy(network.ssid, ssid->valuestring, sizeof(network.ssid) - 1);
-    if (cJSON_IsString(password)) {
-        strncpy(network.password, password->valuestring, sizeof(network.password) - 1);
-    }
-    if (cJSON_IsNumber(priority)) {
-        network.priority = (uint8_t)priority->valueint;
-    }
-    
+    // Upsert: fields not present in the request keep their saved values
+    esp_err_t ret = wifi_mgr_network_upsert(ssid->valuestring,
+                                            cJSON_IsString(password) ? password->valuestring : NULL,
+                                            cJSON_IsNumber(priority) ? priority->valueint : -1,
+                                            true);
     cJSON_Delete(json);
-    
-    esp_err_t ret = wifi_manager_add_network(&network);
-    if (ret == ESP_ERR_INVALID_STATE) {
-        // Network already exists — update it instead (upsert)
-        ret = wifi_manager_update_network(&network);
+
+    if (ret == ESP_ERR_NO_MEM) {
+        return send_error(req, 400, "Network list full");
     }
     if (ret != ESP_OK) {
         return send_error(req, 400, "Failed");
@@ -329,13 +323,9 @@ static esp_err_t handler_delete_network(httpd_req_t *req)
         return ESP_FAIL;
     }
     
-    // Extract SSID from URI
-    char ssid[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(ssid, last_slash + 1, sizeof(ssid) - 1);
-    }
+    // Extract and URL-decode SSID from URI
+    char ssid[sizeof(((wifi_network_t *)0)->ssid)] = {0};
+    wifi_mgr_sm_uri_last_segment(ssid, sizeof(ssid), req->uri);
     
     if (!ssid[0]) {
         return send_error(req, 400, "Missing ssid");
@@ -356,13 +346,9 @@ static esp_err_t handler_put_network(httpd_req_t *req)
         return ESP_FAIL;
     }
     
-    // Extract SSID from URI
-    char ssid[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(ssid, last_slash + 1, sizeof(ssid) - 1);
-    }
+    // Extract and URL-decode SSID from URI
+    char ssid[sizeof(((wifi_network_t *)0)->ssid)] = {0};
+    wifi_mgr_sm_uri_last_segment(ssid, sizeof(ssid), req->uri);
     
     if (!ssid[0]) {
         return send_error(req, 400, "Missing ssid");
@@ -373,22 +359,16 @@ static esp_err_t handler_put_network(httpd_req_t *req)
         return send_error(req, 400, "Invalid JSON");
     }
     
-    wifi_network_t network = {0};
-    strncpy(network.ssid, ssid, sizeof(network.ssid) - 1);
-    
     cJSON *password = cJSON_GetObjectItem(json, "password");
     cJSON *priority = cJSON_GetObjectItem(json, "priority");
-    
-    if (cJSON_IsString(password)) {
-        strncpy(network.password, password->valuestring, sizeof(network.password) - 1);
-    }
-    if (cJSON_IsNumber(priority)) {
-        network.priority = (uint8_t)priority->valueint;
-    }
-    
+
+    // Partial update: omitted fields keep their saved values
+    esp_err_t ret = wifi_mgr_network_upsert(ssid,
+                                            cJSON_IsString(password) ? password->valuestring : NULL,
+                                            cJSON_IsNumber(priority) ? priority->valueint : -1,
+                                            false);
     cJSON_Delete(json);
-    
-    esp_err_t ret = wifi_manager_update_network(&network);
+
     if (ret == ESP_ERR_NOT_FOUND) {
         return send_error(req, 404, "Not found");
     }
@@ -619,13 +599,9 @@ static esp_err_t handler_put_var(httpd_req_t *req)
         return ESP_FAIL;
     }
     
-    // Extract key from URI
-    char key[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(key, last_slash + 1, sizeof(key) - 1);
-    }
+    // Extract and URL-decode key from URI
+    char key[sizeof(((wifi_var_t *)0)->key)] = {0};
+    wifi_mgr_sm_uri_last_segment(key, sizeof(key), req->uri);
     
     if (!key[0]) {
         return send_error(req, 400, "Missing key");
@@ -645,6 +621,9 @@ static esp_err_t handler_put_var(httpd_req_t *req)
     esp_err_t set_ret = wifi_manager_set_var(key, value->valuestring);
     cJSON_Delete(json);
 
+    if (set_ret == ESP_ERR_NO_MEM) {
+        return send_error(req, 400, "Too many variables");
+    }
     if (set_ret != ESP_OK) {
         return send_error(req, 400, "var_invalid");
     }
@@ -659,13 +638,9 @@ static esp_err_t handler_delete_var(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Extract key from URI
-    char key[32] = {0};
-    const char *uri = req->uri;
-    const char *last_slash = strrchr(uri, '/');
-    if (last_slash && strlen(last_slash) > 1) {
-        strncpy(key, last_slash + 1, sizeof(key) - 1);
-    }
+    // Extract and URL-decode key from URI
+    char key[sizeof(((wifi_var_t *)0)->key)] = {0};
+    wifi_mgr_sm_uri_last_segment(key, sizeof(key), req->uri);
 
     if (!key[0]) {
         return send_error(req, 400, "Missing key");
@@ -698,6 +673,7 @@ static esp_err_t handler_post_factory_reset(httpd_req_t *req)
 // Simple Fallback Page (when Web UI not enabled)
 // =============================================================================
 
+#ifndef CONFIG_WIFI_MGR_ENABLE_WEBUI
 static const char *simple_page_html =
     "<!DOCTYPE html><html><head>"
     "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -754,9 +730,9 @@ static esp_err_t handler_simple_page(httpd_req_t *req)
 {
     add_cors_headers(req);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, simple_page_html, strlen(simple_page_html));
-    return ESP_OK;
+    return httpd_resp_send(req, simple_page_html, strlen(simple_page_html));
 }
+#endif // !CONFIG_WIFI_MGR_ENABLE_WEBUI
 
 // =============================================================================
 // Captive Portal

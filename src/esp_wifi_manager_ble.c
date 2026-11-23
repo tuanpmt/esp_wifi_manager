@@ -126,22 +126,11 @@ static cJSON *handle_add_network(cJSON *params)
         return NULL;
     }
 
-    wifi_network_t network = {0};
-    strncpy(network.ssid, ssid->valuestring, sizeof(network.ssid) - 1);
-    if (cJSON_IsString(password)) {
-        strncpy(network.password, password->valuestring, sizeof(network.password) - 1);
-    }
-    if (cJSON_IsNumber(priority)) {
-        network.priority = (uint8_t)priority->valueint;
-    } else {
-        network.priority = 10;
-    }
-
-    esp_err_t ret = wifi_manager_add_network(&network);
-    if (ret == ESP_ERR_INVALID_STATE) {
-        // Network already exists — update it instead (upsert)
-        ret = wifi_manager_update_network(&network);
-    }
+    // Upsert: fields not present in the request keep their saved values
+    esp_err_t ret = wifi_mgr_network_upsert(ssid->valuestring,
+                                            cJSON_IsString(password) ? password->valuestring : NULL,
+                                            cJSON_IsNumber(priority) ? priority->valueint : -1,
+                                            true);
     if (ret != ESP_OK) {
         return NULL;
     }
@@ -269,19 +258,14 @@ static cJSON *handle_update_network(cJSON *params)
         return NULL;
     }
 
-    wifi_network_t network = {0};
-    strncpy(network.ssid, ssid->valuestring, sizeof(network.ssid) - 1);
-
     cJSON *password = cJSON_GetObjectItem(params, "password");
     cJSON *priority = cJSON_GetObjectItem(params, "priority");
-    if (cJSON_IsString(password)) {
-        strncpy(network.password, password->valuestring, sizeof(network.password) - 1);
-    }
-    if (cJSON_IsNumber(priority)) {
-        network.priority = (uint8_t)priority->valueint;
-    }
 
-    esp_err_t ret = wifi_manager_update_network(&network);
+    // Partial update: omitted fields keep their saved values
+    esp_err_t ret = wifi_mgr_network_upsert(ssid->valuestring,
+                                            cJSON_IsString(password) ? password->valuestring : NULL,
+                                            cJSON_IsNumber(priority) ? priority->valueint : -1,
+                                            false);
     if (ret != ESP_OK) {
         return NULL;
     }

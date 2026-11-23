@@ -94,6 +94,7 @@ extern "C" {
 #define WIFI_MGR_TASK_PRIORITY      CONFIG_WIFI_MGR_TASK_PRIORITY
 #define WIFI_MGR_HTTP_MAX_HANDLERS  CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
 #define WIFI_MGR_QUEUE_SIZE         10
+#define WIFI_MGR_DEFAULT_PRIORITY   10
 
 // Event bits (for sync waits)
 #define WIFI_CONNECTED_BIT          BIT0
@@ -237,6 +238,18 @@ void wifi_mgr_send_event_data(const wifi_mgr_event_t *event);
 
 // Start connect sequence (non-blocking, called from task)
 void wifi_mgr_start_connect_sequence(void);
+
+/**
+ * @brief Add or partially update a saved network
+ *
+ * @param ssid         SSID (required, max 32 bytes)
+ * @param password     New password, or NULL to keep the saved one (empty on create)
+ * @param priority     0-255, or -1 to keep the saved one (WIFI_MGR_DEFAULT_PRIORITY on create)
+ * @param allow_create Create the network if it does not exist
+ * @return ESP_OK, ESP_ERR_NOT_FOUND (!allow_create), ESP_ERR_NO_MEM (list full),
+ *         ESP_ERR_INVALID_ARG (bad ssid/password length)
+ */
+esp_err_t wifi_mgr_network_upsert(const char *ssid, const char *password, int priority, bool allow_create);
 void wifi_mgr_schedule_reconnect(void);
 void wifi_mgr_cancel_reconnect(void);
 

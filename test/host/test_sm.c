@@ -134,6 +134,94 @@ static void test_ssid_copy_null_src_gives_empty(void)
     EXPECT_EQ(dst[0], '\0');
 }
 
+// --- NVS migration for ssid[32] -> ssid[33] (v1.x blobs) ---------------------
+
+typedef struct { char ssid[32]; char password[64]; uint8_t priority; } legacy_net_t;
+typedef struct { char ssid[33]; char password[64]; uint8_t priority; } new_net_t;
+
+static void test_migrate_legacy_network_blob(void)
+{
+    legacy_net_t old;
+    memset(&old, 0, sizeof(old));
+    strcpy(old.ssid, "HomeWiFi");
+    strcpy(old.password, "secret123");
+    old.priority = 42;
+
+    new_net_t out;
+    memset(&out, 0xAA, sizeof(out));
+    EXPECT_EQ(wifi_mgr_sm_migrate_ssid32_blob(&old, sizeof(old), &out, sizeof(out)), 1);
+    EXPECT_EQ(strcmp(out.ssid, "HomeWiFi"), 0);
+    EXPECT_EQ(strcmp(out.password, "secret123"), 0);
+    EXPECT_EQ(out.priority, 42);
+}
+
+static void test_migrate_legacy_blob_with_full_31_char_ssid(void)
+{
+    legacy_net_t old;
+    memset(&old, 0, sizeof(old));
+    memcpy(old.ssid, "0123456789012345678901234567890", 31);  // max legacy length
+    strcpy(old.password, "pw");
+
+    new_net_t out;
+    EXPECT_EQ(wifi_mgr_sm_migrate_ssid32_blob(&old, sizeof(old), &out, sizeof(out)), 1);
+    EXPECT_EQ(strlen(out.ssid), 31);
+    EXPECT_EQ(strcmp(out.password, "pw"), 0);
+}
+
+static void test_migrate_rejects_wrong_size(void)
+{
+    uint8_t old[10] = {0};
+    new_net_t out;
+    EXPECT_EQ(wifi_mgr_sm_migrate_ssid32_blob(old, sizeof(old), &out, sizeof(out)), 0);
+}
+
+// --- URI path segment decoding (REST /networks/:ssid, /vars/:key) ----------
+
+static void test_uri_segment_decodes_percent_escapes(void)
+{
+    char out[33];
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/api/wifi/networks/My%20WiFi"), 1);
+    EXPECT_EQ(strcmp(out, "My WiFi"), 0);
+}
+
+static void test_uri_segment_decodes_utf8(void)
+{
+    char out[33];
+    // "Nhà" = N h 0xC3 0xA0
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/api/wifi/networks/Nh%C3%A0"), 1);
+    EXPECT_EQ(strcmp(out, "Nh\xC3\xA0"), 0);
+}
+
+static void test_uri_segment_strips_query(void)
+{
+    char out[33];
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/api/wifi/vars/name?x=1"), 1);
+    EXPECT_EQ(strcmp(out, "name"), 0);
+}
+
+static void test_uri_segment_keeps_plus_literal(void)
+{
+    // '+' is only a space in form encoding, not in paths
+    char out[33];
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/a+b"), 1);
+    EXPECT_EQ(strcmp(out, "a+b"), 0);
+}
+
+static void test_uri_segment_rejects_overflow(void)
+{
+    char out[4];
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/abcd"), 0);
+}
+
+static void test_uri_segment_rejects_bad_escape_and_empty(void)
+{
+    char out[16];
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/a%2"), 0);
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/a%zz"), 0);
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/"), 0);
+    EXPECT_EQ(wifi_mgr_sm_uri_last_segment(out, sizeof(out), "/n/%00x"), 0);
+}
+
 int main(void)
 {
     RUN(test_disconnect_during_connect_sequence_is_stale);
@@ -148,6 +236,15 @@ int main(void)
     RUN(test_ssid_copy_32_bytes_is_terminated);
     RUN(test_ssid_copy_truncates_and_terminates);
     RUN(test_ssid_copy_null_src_gives_empty);
+    RUN(test_migrate_legacy_network_blob);
+    RUN(test_migrate_legacy_blob_with_full_31_char_ssid);
+    RUN(test_migrate_rejects_wrong_size);
+    RUN(test_uri_segment_decodes_percent_escapes);
+    RUN(test_uri_segment_decodes_utf8);
+    RUN(test_uri_segment_strips_query);
+    RUN(test_uri_segment_keeps_plus_literal);
+    RUN(test_uri_segment_rejects_overflow);
+    RUN(test_uri_segment_rejects_bad_escape_and_empty);
 
     if (failures) {
         printf("\n%d assertion(s) failed\n", failures);

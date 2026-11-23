@@ -54,7 +54,7 @@ esp_err_t wifi_manager_start_ap(const wifi_mgr_ap_config_t *config)
     g_wifi_mgr->ap_active = true;
     
     // Expand SSID template (replace {id} with MAC suffix)
-    char ssid_expanded[32];
+    char ssid_expanded[33];
     wifi_mgr_expand_template(ap_cfg->ssid, ssid_expanded, sizeof(ssid_expanded));
     
     ESP_LOGI(TAG, "Starting AP: %s", ssid_expanded);
@@ -74,8 +74,10 @@ esp_err_t wifi_manager_start_ap(const wifi_mgr_ap_config_t *config)
             .ssid_hidden = ap_cfg->hidden,
         },
     };
-    strncpy((char *)wifi_cfg.ap.ssid, ssid_expanded, sizeof(wifi_cfg.ap.ssid) - 1);
-    wifi_cfg.ap.ssid_len = strlen(ssid_expanded);
+    // wifi_ap_config_t.ssid needs no terminator; ssid_len carries the length
+    size_t ssid_len = strnlen(ssid_expanded, sizeof(wifi_cfg.ap.ssid));
+    memcpy(wifi_cfg.ap.ssid, ssid_expanded, ssid_len);
+    wifi_cfg.ap.ssid_len = ssid_len;
     if (ap_cfg->password[0]) {
         strncpy((char *)wifi_cfg.ap.password, ap_cfg->password, sizeof(wifi_cfg.ap.password) - 1);
     }

@@ -207,6 +207,31 @@ esp_err_t wifi_manager_update_network(const wifi_network_t *network)
     return ESP_ERR_NOT_FOUND;
 }
 
+esp_err_t wifi_mgr_network_upsert(const char *ssid, const char *password, int priority, bool allow_create)
+{
+    if (!g_wifi_mgr || !ssid || !ssid[0]) return ESP_ERR_INVALID_ARG;
+
+    wifi_network_t net = {0};
+    if (strlen(ssid) >= sizeof(net.ssid)) return ESP_ERR_INVALID_ARG;
+    if (password && strlen(password) >= sizeof(net.password)) return ESP_ERR_INVALID_ARG;
+    if (priority > 255) priority = 255;
+
+    esp_err_t ret = wifi_manager_get_network(ssid, &net);
+    if (ret == ESP_OK) {
+        if (password) wifi_mgr_sm_copy_str(net.password, sizeof(net.password), password);
+        if (priority >= 0) net.priority = (uint8_t)priority;
+        return wifi_manager_update_network(&net);
+    }
+    if (ret != ESP_ERR_NOT_FOUND || !allow_create) {
+        return ret;
+    }
+
+    wifi_mgr_sm_copy_str(net.ssid, sizeof(net.ssid), ssid);
+    wifi_mgr_sm_copy_str(net.password, sizeof(net.password), password);
+    net.priority = priority >= 0 ? (uint8_t)priority : WIFI_MGR_DEFAULT_PRIORITY;
+    return wifi_manager_add_network(&net);
+}
+
 esp_err_t wifi_manager_remove_network(const char *ssid)
 {
     if (!g_wifi_mgr || !ssid) return ESP_ERR_INVALID_ARG;
