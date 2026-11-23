@@ -150,3 +150,5 @@ frontend/node_modules/
 dependencies.lock
 dist/*
 venv
+test/host/test_sm
+test/host/*.dSYM/

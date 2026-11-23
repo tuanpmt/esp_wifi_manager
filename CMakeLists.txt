@@ -1,6 +1,7 @@
 set(SRCS
     "src/esp_wifi_manager.c"
     "src/esp_wifi_manager_network.c"
+    "src/esp_wifi_manager_sm.c"
     "src/esp_wifi_manager_ap.c"
     "src/esp_wifi_manager_bus.c"
     "src/esp_wifi_manager_nvs.c"
@@ -13,6 +14,7 @@ set(PRIV_REQUIRES
     esp_bus
     json
     mbedtls
+    esp_timer
 )
 
 set(EMBED_FILES)

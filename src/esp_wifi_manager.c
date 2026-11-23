@@ -25,6 +25,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 static void ip_event_handler(void *arg, esp_event_base_t event_base,
                              int32_t event_id, void *event_data);
 static void wifi_mgr_task(void *arg);
+static void reconnect_timer_cb(void *arg);
 
 // =============================================================================
 // Event Queue Functions
@@ -86,6 +87,15 @@ esp_err_t wifi_manager_init(const wifi_manager_config_t *config)
     
     if (!g_wifi_mgr->mutex || !g_wifi_mgr->event_group || !g_wifi_mgr->queue) {
         ret = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = reconnect_timer_cb,
+        .name = "wifi_mgr_rc",
+    };
+    ret = esp_timer_create(&timer_args, &g_wifi_mgr->reconnect_timer);
+    if (ret != ESP_OK) {
         goto cleanup;
     }
     
@@ -319,6 +329,7 @@ cleanup:
         if (g_wifi_mgr->mutex) vSemaphoreDelete(g_wifi_mgr->mutex);
         if (g_wifi_mgr->event_group) vEventGroupDelete(g_wifi_mgr->event_group);
         if (g_wifi_mgr->queue) vQueueDelete(g_wifi_mgr->queue);
+        if (g_wifi_mgr->reconnect_timer) esp_timer_delete(g_wifi_mgr->reconnect_timer);
         free(g_wifi_mgr);
         g_wifi_mgr = NULL;
     }
@@ -329,9 +340,18 @@ esp_err_t wifi_manager_deinit(bool deinit_wifi)
 {
     if (!g_wifi_mgr) return ESP_ERR_INVALID_STATE;
     
-    // Stop task
-    wifi_mgr_send_event(WM_INT_EVT_STOP);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Stop task: wake any blocking wait in the connect sequence, then wait
+    // for the task to exit before freeing the context it uses.
+    wifi_mgr_cancel_reconnect();
+    xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_STOP_BIT | WIFI_FAIL_BIT);
+    wifi_mgr_event_t stop_evt = { .type = WM_INT_EVT_STOP };
+    xQueueSendToFront(g_wifi_mgr->queue, &stop_evt, pdMS_TO_TICKS(1000));
+    EventBits_t bits = xEventGroupWaitBits(g_wifi_mgr->event_group, WIFI_TASK_DONE_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
+    if (!(bits & WIFI_TASK_DONE_BIT)) {
+        ESP_LOGE(TAG, "Manager task did not stop in time");
+        return ESP_ERR_TIMEOUT;
+    }
 
 #ifdef CONFIG_WIFI_MGR_ENABLE_BLE
     wifi_mgr_ble_deinit();
@@ -358,8 +378,9 @@ esp_err_t wifi_manager_deinit(bool deinit_wifi)
         }
     }
         
-    // Task tự delete khi nhận WM_INT_EVT_STOP, không cần delete lại
+    // Task deletes itself on WM_INT_EVT_STOP
     g_wifi_mgr->task = NULL;
+    esp_timer_delete(g_wifi_mgr->reconnect_timer);
     vSemaphoreDelete(g_wifi_mgr->mutex);
     vEventGroupDelete(g_wifi_mgr->event_group);
     vQueueDelete(g_wifi_mgr->queue);
@@ -392,7 +413,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             wifi_event_sta_connected_t *event = (wifi_event_sta_connected_t *)event_data;
             ESP_LOGI(TAG, "STA connected to %s", event->ssid);
             evt.type = WM_INT_EVT_STA_CONNECTED;
-            strncpy(evt.data.connected.ssid, (char *)event->ssid, sizeof(evt.data.connected.ssid) - 1);
+            wifi_mgr_sm_copy_str(evt.data.connected.ssid, sizeof(evt.data.connected.ssid), (const char *)event->ssid);
             evt.data.connected.channel = event->channel;
             wifi_mgr_send_event_data(&evt);
             break;
@@ -405,8 +426,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_FAIL_BIT);
             xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_CONNECTED_BIT);
             evt.type = WM_INT_EVT_STA_DISCONNECTED;
-            strncpy(evt.data.disconnect.ssid, (char *)event->ssid, sizeof(evt.data.disconnect.ssid) - 1);
+            wifi_mgr_sm_copy_str(evt.data.disconnect.ssid, sizeof(evt.data.disconnect.ssid), (const char *)event->ssid);
             evt.data.disconnect.reason = event->reason;
+            evt.data.disconnect.during_connect = g_wifi_mgr->connecting;
             wifi_mgr_send_event_data(&evt);
             break;
         }
@@ -466,6 +488,37 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 // =============================================================================
+// Reconnect Timer (non-blocking backoff)
+// =============================================================================
+
+static void reconnect_timer_cb(void *arg)
+{
+    wifi_mgr_send_event(WM_INT_EVT_RECONNECT);
+}
+
+void wifi_mgr_schedule_reconnect(void)
+{
+    if (!g_wifi_mgr || !g_wifi_mgr->reconnect_timer) return;
+
+    uint32_t delay = wifi_mgr_sm_backoff_ms(g_wifi_mgr->config.retry_interval_ms,
+                                            g_wifi_mgr->config.retry_max_interval_ms,
+                                            (unsigned)g_wifi_mgr->retry_count);
+    ESP_LOGI(TAG, "Auto-reconnect in %lu ms (attempt %d)",
+             (unsigned long)delay, g_wifi_mgr->retry_count + 1);
+    g_wifi_mgr->retry_count++;
+
+    esp_timer_stop(g_wifi_mgr->reconnect_timer);  // restart if already armed
+    esp_timer_start_once(g_wifi_mgr->reconnect_timer, (uint64_t)delay * 1000);
+}
+
+void wifi_mgr_cancel_reconnect(void)
+{
+    if (g_wifi_mgr && g_wifi_mgr->reconnect_timer) {
+        esp_timer_stop(g_wifi_mgr->reconnect_timer);
+    }
+}
+
+// =============================================================================
 // Manager Task - State Machine
 // =============================================================================
 
@@ -492,42 +545,58 @@ static void wifi_mgr_task(void *arg)
                     }
                     break;
                     
-                case WM_INT_EVT_STA_CONNECTED:
+                case WM_INT_EVT_STA_CONNECTED: {
+                    // Events are processed late when the task was busy; only
+                    // trust this one if the station is still associated.
+                    wifi_ap_record_t ap_info;
+                    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+                        ESP_LOGD(TAG, "Ignoring stale STA_CONNECTED (%s)", evt.data.connected.ssid);
+                        break;
+                    }
                     g_wifi_mgr->state = WIFI_STATE_CONNECTED;
                     g_wifi_mgr->connect_time = esp_timer_get_time() / 1000;
                     g_wifi_mgr->retry_count = 0;
                     g_wifi_mgr->connecting = false;
+                    wifi_mgr_cancel_reconnect();
                     break;
-                    
+                }
+
                 case WM_INT_EVT_STA_DISCONNECTED: {
+                    wifi_ap_record_t ap_info;
+                    wifi_mgr_disc_input_t in = {
+                        .during_connect = evt.data.disconnect.during_connect || g_wifi_mgr->connecting,
+                        .associated = esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK,
+                        .auto_reconnect = g_wifi_mgr->config.auto_reconnect,
+                        .ap_active = g_wifi_mgr->ap_active,
+                    };
+                    wifi_mgr_disc_action_t action = wifi_mgr_sm_on_disconnect(&in);
+                    if (action == WIFI_MGR_DISC_STALE) {
+                        ESP_LOGD(TAG, "Ignoring stale disconnect from %s (reason %d)",
+                                 evt.data.disconnect.ssid, evt.data.disconnect.reason);
+                        break;
+                    }
+
                     g_wifi_mgr->state = WIFI_STATE_DISCONNECTED;
                     xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_CONNECTED_BIT);
                     xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_FAIL_BIT);
 
                     // Emit esp_bus event
                     wifi_disconnected_t disc = {.reason = evt.data.disconnect.reason};
-                    strncpy(disc.ssid, evt.data.disconnect.ssid, sizeof(disc.ssid) - 1);
+                    wifi_mgr_sm_copy_str(disc.ssid, sizeof(disc.ssid), evt.data.disconnect.ssid);
                     esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_DISCONNECTED, &disc, sizeof(disc));
 
-                    // Auto reconnect if enabled and not in AP mode
-                    if (g_wifi_mgr->config.auto_reconnect && !g_wifi_mgr->ap_active && !g_wifi_mgr->connecting) {
-                        // Exponential backoff for reconnect
-                        uint32_t base = g_wifi_mgr->config.retry_interval_ms;
-                        uint32_t max_delay = g_wifi_mgr->config.retry_max_interval_ms;
-                        uint32_t delay = base << g_wifi_mgr->retry_count;
-                        if (delay > max_delay || delay < base) delay = max_delay;
-
-                        ESP_LOGI(TAG, "Auto-reconnect in %lu ms (attempt %d)",
-                                 (unsigned long)delay, g_wifi_mgr->retry_count + 1);
-                        g_wifi_mgr->retry_count++;
-
-                        vTaskDelay(pdMS_TO_TICKS(delay));
-                        if (!g_wifi_mgr->ap_active) {
-                            wifi_mgr_start_connect_sequence();
-                        }
+                    if (action == WIFI_MGR_DISC_LOST_RECONNECT) {
+                        wifi_mgr_schedule_reconnect();
                     }
                     break;
                 }
+
+                case WM_INT_EVT_RECONNECT:
+                    if (!g_wifi_mgr->ap_active && !g_wifi_mgr->connecting &&
+                        g_wifi_mgr->state != WIFI_STATE_CONNECTED) {
+                        wifi_mgr_start_connect_sequence();
+                    }
+                    break;
                     
                 case WM_INT_EVT_GOT_IP: {
                     xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_CONNECTED_BIT);
@@ -593,6 +662,7 @@ static void wifi_mgr_task(void *arg)
                     
                 case WM_INT_EVT_STOP:
                     ESP_LOGI(TAG, "Task stopped");
+                    xEventGroupSetBits(g_wifi_mgr->event_group, WIFI_TASK_DONE_BIT);
                     vTaskDelete(NULL);
                     return;
                     

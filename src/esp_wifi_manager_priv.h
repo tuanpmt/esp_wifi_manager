@@ -15,6 +15,8 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+#include "esp_wifi_manager_sm.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -97,6 +99,8 @@ extern "C" {
 #define WIFI_CONNECTED_BIT          BIT0
 #define WIFI_FAIL_BIT               BIT1
 #define WIFI_SCAN_DONE_BIT          BIT2
+#define WIFI_STOP_BIT               BIT3    // deinit requested, abort waits
+#define WIFI_TASK_DONE_BIT          BIT4    // manager task has exited
 
 // =============================================================================
 // Internal Events (sent to task queue)
@@ -117,6 +121,7 @@ typedef enum {
     WM_INT_EVT_DISCONNECT_REQUEST,  // Manual disconnect request
     WM_INT_EVT_START_AP_REQUEST,    // Manual start AP request
     WM_INT_EVT_STOP_AP_REQUEST,     // Manual stop AP request
+    WM_INT_EVT_RECONNECT,           // Backoff timer expired, run connect sequence
     WM_INT_EVT_STOP,                // Stop task
 } wifi_mgr_internal_evt_t;
 
@@ -124,11 +129,12 @@ typedef struct {
     wifi_mgr_internal_evt_t type;
     union {
         struct {
-            char ssid[32];
+            char ssid[33];
             uint8_t reason;
+            bool during_connect;    // raised while the connect sequence was running
         } disconnect;
         struct {
-            char ssid[32];
+            char ssid[33];
             int8_t rssi;
             uint8_t channel;
         } connected;
@@ -136,7 +142,7 @@ typedef struct {
             esp_netif_ip_info_t ip_info;
         } got_ip;
         struct {
-            char ssid[32];
+            char ssid[33];
         } connect_req;
         uint8_t mac[6];
     } data;
@@ -151,7 +157,7 @@ typedef struct {
     wifi_state_t state;
     bool initialized;
     bool ap_active;
-    bool connecting;                // Currently in connect sequence
+    volatile bool connecting;       // Currently in connect sequence (read from event handler)
     int64_t connect_time;           // Connection start time
     
     // Config
@@ -185,6 +191,7 @@ typedef struct {
     SemaphoreHandle_t mutex;
     
     // Retry state
+    esp_timer_handle_t reconnect_timer;  // One-shot backoff timer (non-blocking reconnect)
     int retry_count;
     int current_network_idx;
     
@@ -230,6 +237,8 @@ void wifi_mgr_send_event_data(const wifi_mgr_event_t *event);
 
 // Start connect sequence (non-blocking, called from task)
 void wifi_mgr_start_connect_sequence(void);
+void wifi_mgr_schedule_reconnect(void);
+void wifi_mgr_cancel_reconnect(void);
 
 // AP mode control (called from task)
 void wifi_mgr_start_ap_mode(void);

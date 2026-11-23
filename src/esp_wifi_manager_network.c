@@ -32,24 +32,34 @@ static void sort_networks_by_priority(void)
 }
 
 /**
- * @brief Calculate exponential backoff delay
- * @param retry Current retry number (0-based)
- * @return Delay in milliseconds
+ * @brief Fill STA config from a saved network
+ *
+ * wifi_sta_config_t.ssid is 32 bytes and does NOT need a terminator, so a
+ * 32-byte SSID must be copied in full (strncpy(..., sizeof - 1) truncated it).
  */
-static uint32_t calc_backoff_delay(int retry)
+static void fill_sta_config(wifi_config_t *cfg, const wifi_network_t *net)
 {
-    uint32_t base = g_wifi_mgr->config.retry_interval_ms;
-    uint32_t max_delay = g_wifi_mgr->config.retry_max_interval_ms;
+    memset(cfg, 0, sizeof(*cfg));
+    memcpy(cfg->sta.ssid, net->ssid, strnlen(net->ssid, sizeof(cfg->sta.ssid)));
+    memcpy(cfg->sta.password, net->password, strnlen(net->password, sizeof(cfg->sta.password)));
+    // Probe all channels so hidden networks (SSID entered manually) are found
+    cfg->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    cfg->sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+}
 
-    // Exponential backoff: base * 2^retry
-    uint32_t delay = base << retry;  // base * 2^retry
+static bool stop_requested(void)
+{
+    return (xEventGroupGetBits(g_wifi_mgr->event_group) & WIFI_STOP_BIT) != 0;
+}
 
-    // Cap at max delay
-    if (delay > max_delay || delay < base) {  // overflow check
-        delay = max_delay;
-    }
-
-    return delay;
+/**
+ * @brief Sleep for delay_ms, returning early (true) if deinit was requested
+ */
+static bool wait_or_stop(uint32_t delay_ms)
+{
+    EventBits_t bits = xEventGroupWaitBits(g_wifi_mgr->event_group, WIFI_STOP_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(delay_ms));
+    return (bits & WIFI_STOP_BIT) != 0;
 }
 
 void wifi_mgr_start_connect_sequence(void)
@@ -68,7 +78,7 @@ void wifi_mgr_start_connect_sequence(void)
     wifi_mgr_unlock();
 
     // Try each network (AP can run in parallel - AP+STA mode)
-    for (size_t i = 0; i < g_wifi_mgr->network_count; i++) {
+    for (size_t i = 0; i < g_wifi_mgr->network_count && !stop_requested(); i++) {
         wifi_network_t *net = &g_wifi_mgr->networks[i];
         ESP_LOGI(TAG, "Trying network: %s (priority: %d)", net->ssid, net->priority);
 
@@ -76,13 +86,13 @@ void wifi_mgr_start_connect_sequence(void)
         g_wifi_mgr->current_network_idx = i;
         esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_CONNECTING, net->ssid, strlen(net->ssid) + 1);
 
-        wifi_config_t wifi_cfg = {0};
-        strncpy((char *)wifi_cfg.sta.ssid, net->ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-        strncpy((char *)wifi_cfg.sta.password, net->password, sizeof(wifi_cfg.sta.password) - 1);
+        wifi_config_t wifi_cfg;
+        fill_sta_config(&wifi_cfg, net);
 
         esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
 
         for (int retry = 0; retry < g_wifi_mgr->config.max_retry_per_network; retry++) {
+            if (stop_requested()) break;
             xEventGroupClearBits(g_wifi_mgr->event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
             esp_err_t err = esp_wifi_connect();
@@ -108,14 +118,17 @@ void wifi_mgr_start_connect_sequence(void)
                      net->ssid, retry + 1, g_wifi_mgr->config.max_retry_per_network);
 
             if (retry < g_wifi_mgr->config.max_retry_per_network - 1) {
-                uint32_t delay = calc_backoff_delay(retry);
+                uint32_t delay = wifi_mgr_sm_backoff_ms(g_wifi_mgr->config.retry_interval_ms,
+                                                        g_wifi_mgr->config.retry_max_interval_ms,
+                                                        (unsigned)retry);
                 ESP_LOGI(TAG, "Backoff delay: %lu ms", (unsigned long)delay);
-                vTaskDelay(pdMS_TO_TICKS(delay));
+                if (wait_or_stop(delay)) break;
             }
         }
     }
 
     g_wifi_mgr->connecting = false;
+    if (stop_requested()) return;
 
     ESP_LOGW(TAG, "Failed to connect to any network");
     g_wifi_mgr->state = WIFI_STATE_DISCONNECTED;
@@ -124,6 +137,10 @@ void wifi_mgr_start_connect_sequence(void)
     if (g_wifi_mgr->config.enable_captive_portal && !g_wifi_mgr->ap_active) {
         ESP_LOGI(TAG, "Starting captive portal");
         wifi_manager_start_ap(NULL);
+    } else if (g_wifi_mgr->config.auto_reconnect && !g_wifi_mgr->ap_active) {
+        // No portal: keep trying in the background with backoff. Failed
+        // attempts no longer trigger reconnects via stale events (issue #14).
+        wifi_mgr_schedule_reconnect();
     }
 }
 
@@ -206,6 +223,16 @@ esp_err_t wifi_manager_remove_network(const char *ssid)
             wifi_mgr_unlock();
             esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_NETWORK_REMOVED, ssid, strlen(ssid) + 1);
             ESP_LOGI(TAG, "Network removed: %s", ssid);
+
+            // Removing the network we are connected to drops the link (issue #10).
+            // Auto-reconnect then moves to the next saved network, or the
+            // captive portal starts if none are left.
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK &&
+                strncmp((const char *)ap_info.ssid, ssid, sizeof(ap_info.ssid)) == 0) {
+                ESP_LOGI(TAG, "Disconnecting from removed network %s", ssid);
+                esp_wifi_disconnect();
+            }
             return ESP_OK;
         }
     }
@@ -291,9 +318,8 @@ esp_err_t wifi_manager_connect(const char *ssid)
     g_wifi_mgr->state = WIFI_STATE_CONNECTING;
     esp_bus_emit(WIFI_MODULE, WIFI_MGR_EVT_CONNECTING, ssid, strlen(ssid) + 1);
     
-    wifi_config_t wifi_cfg = {0};
-    strncpy((char *)wifi_cfg.sta.ssid, net->ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, net->password, sizeof(wifi_cfg.sta.password) - 1);
+    wifi_config_t wifi_cfg;
+    fill_sta_config(&wifi_cfg, net);
     
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     return esp_wifi_connect();
@@ -352,7 +378,7 @@ esp_err_t wifi_manager_scan(wifi_scan_result_t *results, size_t max_count, size_
     if (copy_count > max_count) copy_count = max_count;
     
     for (size_t i = 0; i < copy_count; i++) {
-        strncpy(results[i].ssid, (char *)ap_list[i].ssid, sizeof(results[i].ssid) - 1);
+        wifi_mgr_sm_copy_str(results[i].ssid, sizeof(results[i].ssid), (const char *)ap_list[i].ssid);
         results[i].rssi = ap_list[i].rssi;
         results[i].auth = ap_list[i].authmode;
     }
