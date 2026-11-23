@@ -128,5 +128,15 @@ menu "WiFi Manager"
             BLE advertising name. Supports {id} placeholder which
             will be replaced with last 3 bytes of MAC address.
 
+    config WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM
+        bool "Release Bluetooth Classic memory (Bluedroid)"
+        default n
+        depends on WIFI_MGR_ENABLE_BLE && BT_BLUEDROID_ENABLED && SOC_BT_CLASSIC_SUPPORTED
+        help
+            Call esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT) before
+            starting the BLE stack. This frees RAM on ESP32, but Bluetooth
+            Classic can then never be used again until reboot. Leave disabled
+            if the application needs Bluetooth Classic.
+
 endmenu
 

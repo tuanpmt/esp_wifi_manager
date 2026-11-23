@@ -11,6 +11,8 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #ifdef CONFIG_WIFI_MGR_ENABLE_BLE
 
@@ -22,8 +24,32 @@ static const char *TAG = "wifi_mgr_ble";
 // Connection State (shared)
 // =============================================================================
 
-static bool s_connected = false;
-static bool s_response_notify_enabled = false;
+static volatile bool s_connected = false;
+static volatile bool s_response_notify_enabled = false;
+static bool s_initialized = false;
+
+// =============================================================================
+// Command Queue
+// =============================================================================
+//
+// Backends call wifi_mgr_ble_on_command() from the BLE host task (NimBLE host
+// or Bluedroid BTC task). Commands such as "scan" block for seconds and build
+// large JSON documents, so they are processed on a dedicated task instead.
+
+#define BLE_CMD_MAX_LEN          512
+#define BLE_CMD_QUEUE_DEPTH      2
+#define BLE_CMD_TASK_STACK_SIZE  4096
+
+typedef struct {
+    char *data;     // NUL-terminated, heap-allocated; NULL = stop request
+} ble_cmd_msg_t;
+
+static QueueHandle_t s_cmd_queue;
+static TaskHandle_t s_cmd_task;
+static SemaphoreHandle_t s_cmd_task_done;
+
+static void handle_command(const char *json_str);
+static void send_response(const char *json_str);
 
 // =============================================================================
 // Command Handlers
@@ -189,7 +215,7 @@ static cJSON *handle_ap_status(void)
 static cJSON *handle_start_ap(cJSON *params)
 {
     wifi_mgr_ap_config_t *config = NULL;
-    wifi_mgr_ap_config_t temp_config;
+    wifi_mgr_ap_config_t temp_config = {0};
 
     if (params) {
         wifi_manager_get_ap_config(&temp_config);
@@ -442,17 +468,89 @@ static void handle_command(const char *json_str)
 // Callbacks from stack backend
 // =============================================================================
 
+static void ble_cmd_task(void *arg)
+{
+    ble_cmd_msg_t msg;
+    while (xQueueReceive(s_cmd_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        if (!msg.data) {
+            break;  // stop request
+        }
+        handle_command(msg.data);
+        free(msg.data);
+    }
+    xSemaphoreGive(s_cmd_task_done);
+    vTaskDelete(NULL);
+}
+
 void wifi_mgr_ble_on_command(const uint8_t *data, size_t length)
 {
-    char cmd_buf[512];
-    size_t len = length;
-    if (len > sizeof(cmd_buf) - 1) {
-        len = sizeof(cmd_buf) - 1;
+    if (!s_cmd_queue || !data || length == 0) {
+        return;
     }
-    memcpy(cmd_buf, data, len);
-    cmd_buf[len] = '\0';
+    if (length > BLE_CMD_MAX_LEN) {
+        ESP_LOGW(TAG, "Command too long (%u bytes), max %d", (unsigned)length, BLE_CMD_MAX_LEN);
+        send_response("{\"status\":\"error\",\"error\":\"Command too long\"}");
+        return;
+    }
 
-    handle_command(cmd_buf);
+    ble_cmd_msg_t msg = { .data = malloc(length + 1) };
+    if (!msg.data) {
+        return;
+    }
+    memcpy(msg.data, data, length);
+    msg.data[length] = '\0';
+
+    if (xQueueSend(s_cmd_queue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Command queue full, dropping command");
+        free(msg.data);
+        send_response("{\"status\":\"error\",\"error\":\"Busy\"}");
+    }
+}
+
+static esp_err_t cmd_task_start(void)
+{
+    s_cmd_queue = xQueueCreate(BLE_CMD_QUEUE_DEPTH, sizeof(ble_cmd_msg_t));
+    s_cmd_task_done = xSemaphoreCreateBinary();
+    if (!s_cmd_queue || !s_cmd_task_done ||
+        xTaskCreate(ble_cmd_task, "wifi_ble_cmd", BLE_CMD_TASK_STACK_SIZE, NULL,
+                    WIFI_MGR_TASK_PRIORITY, &s_cmd_task) != pdPASS) {
+        if (s_cmd_queue) vQueueDelete(s_cmd_queue);
+        if (s_cmd_task_done) vSemaphoreDelete(s_cmd_task_done);
+        s_cmd_queue = NULL;
+        s_cmd_task_done = NULL;
+        s_cmd_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+/**
+ * @brief Stop the command task after it finishes the command in progress
+ */
+static void cmd_task_stop(void)
+{
+    if (!s_cmd_task) {
+        return;
+    }
+    // Drop queued commands, then ask the task to exit and wait for it
+    ble_cmd_msg_t msg;
+    while (xQueueReceive(s_cmd_queue, &msg, 0) == pdTRUE) {
+        free(msg.data);
+    }
+    msg.data = NULL;
+    xQueueSend(s_cmd_queue, &msg, portMAX_DELAY);
+    if (xSemaphoreTake(s_cmd_task_done, pdMS_TO_TICKS(15000)) != pdTRUE) {
+        ESP_LOGE(TAG, "BLE command task did not stop in time");
+        return;  // leak rather than free resources still in use
+    }
+    s_cmd_task = NULL;
+    while (xQueueReceive(s_cmd_queue, &msg, 0) == pdTRUE) {
+        free(msg.data);
+    }
+    vQueueDelete(s_cmd_queue);
+    vSemaphoreDelete(s_cmd_task_done);
+    s_cmd_queue = NULL;
+    s_cmd_task_done = NULL;
 }
 
 void wifi_mgr_ble_on_connect(void)
@@ -481,6 +579,9 @@ esp_err_t wifi_mgr_ble_init(void)
     if (!g_wifi_mgr) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_initialized) {
+        return ESP_OK;
+    }
 
     ESP_LOGI(TAG, "Initializing BLE interface");
 
@@ -493,21 +594,40 @@ esp_err_t wifi_mgr_ble_init(void)
     char device_name[32];
     wifi_mgr_expand_template(name_template, device_name, sizeof(device_name));
 
-    esp_err_t ret = wifi_mgr_ble_backend_init(device_name);
+    esp_err_t ret = cmd_task_start();
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start BLE command task");
         return ret;
     }
 
+    ret = wifi_mgr_ble_backend_init(device_name);
+    if (ret != ESP_OK) {
+        cmd_task_stop();
+        return ret;
+    }
+
+    s_initialized = true;
     ESP_LOGI(TAG, "BLE interface initialized");
     return ESP_OK;
 }
 
 esp_err_t wifi_mgr_ble_deinit(void)
 {
+    // Never touch the BLE stack if we did not start the interface: the
+    // application may own it (ble.enable=false or init failed).
+    if (!s_initialized) {
+        return ESP_OK;
+    }
     ESP_LOGI(TAG, "Deinitializing BLE interface");
+
+    // Stop command processing before the transport goes away
+    cmd_task_stop();
+    esp_err_t ret = wifi_mgr_ble_backend_deinit();
+
     s_connected = false;
     s_response_notify_enabled = false;
-    return wifi_mgr_ble_backend_deinit();
+    s_initialized = false;
+    return ret;
 }
 
 #else // CONFIG_WIFI_MGR_ENABLE_BLE

@@ -13,7 +13,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
+#include "esp_bt.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -27,15 +27,8 @@
 
 static const char *TAG = "wifi_mgr_ble_nb";
 
-/** Stack size for the command-processing task (handles JSON + WiFi scan). */
-#define BLE_CMD_TASK_STACK_SIZE  4096
-#define BLE_CMD_QUEUE_DEPTH      2
-
-/** Queued command message. */
-typedef struct {
-    uint8_t *data;   /**< heap-allocated copy of command bytes */
-    uint16_t length;
-} ble_cmd_msg_t;
+/** Largest command accepted on the Command characteristic. */
+#define BLE_CMD_MAX_LEN  512
 
 // =============================================================================
 // UUIDs
@@ -57,8 +50,10 @@ static const ble_uuid16_t s_char_response_uuid =
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_response_val_handle;
 static char s_device_name[32];
-static QueueHandle_t s_cmd_queue;
-static TaskHandle_t  s_cmd_task;
+
+/** Application host callbacks replaced at init, restored at deinit (service-only mode). */
+static ble_hs_sync_fn *s_prev_sync_cb;
+static ble_hs_reset_fn *s_prev_reset_cb;
 
 /** true if we initialized the NimBLE stack ourselves; false if it was already running. */
 static bool s_ble_stack_owned = false;
@@ -88,11 +83,11 @@ static int gatt_command_access(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        // Flatten the mbuf chain into a heap buffer and queue for processing
-        // off the nimble_host task (whose stack is too small for command handling).
+        // Flatten the mbuf chain; the shared layer copies it and processes the
+        // command on its own task (the nimble_host stack is too small for that).
         uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
-        if (om_len == 0 || om_len > 512) {
-            return BLE_ATT_ERR_UNLIKELY;
+        if (om_len == 0 || om_len > BLE_CMD_MAX_LEN) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
 
         uint8_t *buf = malloc(om_len);
@@ -102,18 +97,11 @@ static int gatt_command_access(uint16_t conn_handle, uint16_t attr_handle,
 
         uint16_t len = om_len;
         int rc = ble_hs_mbuf_to_flat(ctxt->om, buf, len, &len);
-        if (rc != 0) {
-            free(buf);
-            return BLE_ATT_ERR_UNLIKELY;
+        if (rc == 0) {
+            wifi_mgr_ble_on_command(buf, len);
         }
-
-        ble_cmd_msg_t msg = { .data = buf, .length = len };
-        if (xQueueSend(s_cmd_queue, &msg, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Command queue full, dropping command");
-            free(buf);
-        }
-
-        return 0;
+        free(buf);
+        return rc == 0 ? 0 : BLE_ATT_ERR_UNLIKELY;
     }
     return BLE_ATT_ERR_UNLIKELY;
 }
@@ -268,16 +256,6 @@ static void ble_on_reset(int reason)
     ESP_LOGW(TAG, "BLE host reset, reason=%d", reason);
 }
 
-static void ble_cmd_task(void *param)
-{
-    ble_cmd_msg_t msg;
-    while (xQueueReceive(s_cmd_queue, &msg, portMAX_DELAY) == pdTRUE) {
-        wifi_mgr_ble_on_command(msg.data, msg.length);
-        free(msg.data);
-    }
-    vTaskDelete(NULL);
-}
-
 static void nimble_host_task(void *param)
 {
     nimble_port_run();
@@ -318,7 +296,11 @@ uint16_t wifi_mgr_ble_backend_get_mtu(void)
 
 bool wifi_mgr_ble_backend_is_stack_running(void)
 {
-    return ble_hs_is_enabled();
+    // ble_hs_is_enabled() only turns true once the host task has started, so
+    // an application that just called nimble_port_init() would be missed and
+    // the stack initialized twice. A non-idle controller means someone owns it.
+    return ble_hs_is_enabled() ||
+           esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE;
 }
 
 esp_err_t wifi_mgr_ble_backend_init(const char *device_name)
@@ -341,7 +323,9 @@ esp_err_t wifi_mgr_ble_backend_init(const char *device_name)
         }
     }
 
-    // Configure host callbacks
+    // Configure host callbacks (remember the application's to restore them)
+    s_prev_sync_cb = ble_hs_cfg.sync_cb;
+    s_prev_reset_cb = ble_hs_cfg.reset_cb;
     ble_hs_cfg.sync_cb = ble_on_sync;
     ble_hs_cfg.reset_cb = ble_on_reset;
 
@@ -368,29 +352,7 @@ esp_err_t wifi_mgr_ble_backend_init(const char *device_name)
     rc = ble_gatts_add_svcs(s_gatt_svcs);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gatts_add_svcs failed, rc=%d", rc);
-        return ESP_FAIL;
-    }
-
-    // Create command processing queue and task (runs off nimble_host stack)
-    s_cmd_queue = xQueueCreate(BLE_CMD_QUEUE_DEPTH, sizeof(ble_cmd_msg_t));
-    if (!s_cmd_queue) {
-        ESP_LOGE(TAG, "Failed to create command queue");
-        if (s_ble_stack_owned) {
-            nimble_port_deinit();
-        }
-        return ESP_ERR_NO_MEM;
-    }
-
-    BaseType_t ret2 = xTaskCreate(ble_cmd_task, "ble_cmd", BLE_CMD_TASK_STACK_SIZE,
-                                   NULL, 5, &s_cmd_task);
-    if (ret2 != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create command task");
-        vQueueDelete(s_cmd_queue);
-        s_cmd_queue = NULL;
-        if (s_ble_stack_owned) {
-            nimble_port_deinit();
-        }
-        return ESP_ERR_NO_MEM;
+        goto fail;
     }
 
     // Start NimBLE host task only if we own the stack
@@ -402,6 +364,15 @@ esp_err_t wifi_mgr_ble_backend_init(const char *device_name)
     }
 
     return ESP_OK;
+
+fail:
+    ble_hs_cfg.sync_cb = s_prev_sync_cb;
+    ble_hs_cfg.reset_cb = s_prev_reset_cb;
+    if (s_ble_stack_owned) {
+        nimble_port_deinit();
+        s_ble_stack_owned = false;
+    }
+    return ESP_FAIL;
 }
 
 esp_err_t wifi_mgr_ble_backend_deinit(void)
@@ -443,20 +414,9 @@ esp_err_t wifi_mgr_ble_backend_deinit(void)
         }
     }
 
-    // Clean up command processing task and queue
-    if (s_cmd_task) {
-        vTaskDelete(s_cmd_task);
-        s_cmd_task = NULL;
-    }
-    if (s_cmd_queue) {
-        // Drain any pending messages to free their heap buffers
-        ble_cmd_msg_t msg;
-        while (xQueueReceive(s_cmd_queue, &msg, 0) == pdTRUE) {
-            free(msg.data);
-        }
-        vQueueDelete(s_cmd_queue);
-        s_cmd_queue = NULL;
-    }
+    // Hand the host callbacks back to the application
+    ble_hs_cfg.sync_cb = s_prev_sync_cb;
+    ble_hs_cfg.reset_cb = s_prev_reset_cb;
 
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_ble_stack_owned = false;

@@ -9,6 +9,7 @@
 
 #include "esp_wifi_manager_ble_int.h"
 #include "esp_log.h"
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_bt.h"
@@ -202,6 +203,58 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
 // GATTS Event Handler
 // =============================================================================
 
+// =============================================================================
+// Prepared (long) writes
+// =============================================================================
+
+#define PREP_WRITE_MAX_LEN 512
+
+static uint8_t *s_prep_buf;
+static size_t s_prep_len;
+
+static void handle_prepare_write(esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+{
+    esp_gatt_status_t status = ESP_GATT_OK;
+
+    if (param->write.handle != wifi_handle_table[IDX_CHAR_COMMAND_VAL]) {
+        status = ESP_GATT_REQ_NOT_SUPPORTED;
+    } else if (param->write.offset + param->write.len > PREP_WRITE_MAX_LEN) {
+        status = ESP_GATT_INVALID_ATTR_LEN;
+    } else if (param->write.offset != s_prep_len) {
+        status = ESP_GATT_INVALID_OFFSET;
+    } else {
+        if (!s_prep_buf) {
+            s_prep_buf = malloc(PREP_WRITE_MAX_LEN);
+            if (!s_prep_buf) status = ESP_GATT_NO_RESOURCES;
+        }
+        if (status == ESP_GATT_OK) {
+            memcpy(s_prep_buf + param->write.offset, param->write.value, param->write.len);
+            s_prep_len = param->write.offset + param->write.len;
+        }
+    }
+
+    if (status != ESP_GATT_OK) {
+        free(s_prep_buf);
+        s_prep_buf = NULL;
+        s_prep_len = 0;
+    }
+
+    if (param->write.need_rsp) {
+        // Prepare write responses must echo the received value
+        esp_gatt_rsp_t *rsp = calloc(1, sizeof(esp_gatt_rsp_t));
+        if (rsp) {
+            rsp->attr_value.handle = param->write.handle;
+            rsp->attr_value.offset = param->write.offset;
+            rsp->attr_value.len = param->write.len;
+            rsp->attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+            memcpy(rsp->attr_value.value, param->write.value, param->write.len);
+        }
+        esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id,
+                                    status, rsp);
+        free(rsp);
+    }
+}
+
 static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                                  esp_ble_gatts_cb_param_t *param)
 {
@@ -254,6 +307,9 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             ESP_LOGI(TAG, "BLE client disconnected");
 
             wifi_mgr_ble_on_disconnect();
+            free(s_prep_buf);
+            s_prep_buf = NULL;
+            s_prep_len = 0;
 
             // Restart advertising
             esp_ble_gap_start_advertising(&adv_params);
@@ -286,7 +342,22 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
                     esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
                                                  param->write.trans_id, ESP_GATT_OK, NULL);
                 }
+            } else {
+                // Long write (command longer than MTU-3): buffer prepared chunks
+                handle_prepare_write(gatts_if, param);
             }
+            break;
+
+        case ESP_GATTS_EXEC_WRITE_EVT:
+            if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC &&
+                s_prep_buf && s_prep_len > 0) {
+                wifi_mgr_ble_on_command(s_prep_buf, s_prep_len);
+            }
+            free(s_prep_buf);
+            s_prep_buf = NULL;
+            s_prep_len = 0;
+            esp_ble_gatts_send_response(gatts_if, param->exec_write.conn_id,
+                                        param->exec_write.trans_id, ESP_GATT_OK, NULL);
             break;
 
         case ESP_GATTS_MTU_EVT:
@@ -309,10 +380,13 @@ esp_err_t wifi_mgr_ble_backend_notify_response(const uint8_t *data, size_t lengt
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_ble_gatts_send_indicate(s_profile.gatts_if, s_profile.conn_id,
-                                 wifi_handle_table[IDX_CHAR_RESPONSE_VAL],
-                                 length, (uint8_t *)data, false);
-    return ESP_OK;
+    esp_err_t ret = esp_ble_gatts_send_indicate(s_profile.gatts_if, s_profile.conn_id,
+                                                wifi_handle_table[IDX_CHAR_RESPONSE_VAL],
+                                                length, (uint8_t *)data, false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Notify failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 uint16_t wifi_mgr_ble_backend_get_mtu(void)
@@ -338,8 +412,14 @@ esp_err_t wifi_mgr_ble_backend_init(const char *device_name)
         // Full stack init
         s_ble_stack_owned = true;
 
-        // Release classic BT memory
-        ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+#ifdef CONFIG_WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM
+        // Opt-in: permanently gives up Bluetooth Classic to save RAM (#11).
+        // Fails harmlessly if already released or the controller is in use.
+        esp_err_t rel = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+        if (rel != ESP_OK) {
+            ESP_LOGW(TAG, "Classic BT mem release skipped: %s", esp_err_to_name(rel));
+        }
+#endif
 
         // Initialize BT controller
         esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
