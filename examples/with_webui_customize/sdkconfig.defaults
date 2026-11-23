@@ -10,3 +10,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # Captive portal: modern Android/Chrome probes send long headers (default 512 -> HTTP 431)
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# 1.5 MB app + 512 KB LittleFS needs more than the 2 MB default flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
