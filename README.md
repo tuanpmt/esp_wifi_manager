@@ -130,6 +130,9 @@ void app_main(void)
 | [with_webui](examples/with_webui/) | Embedded Web UI (no external files needed) |
 | [with_webui_customize](examples/with_webui_customize/) | Custom frontend from LittleFS |
 | [with_ble](examples/with_ble/) | BLE GATT interface for smartphone/Python CLI |
+| [with_ble_deinit](examples/with_ble_deinit/) | NimBLE, app-owned stack kept running after WiFi Manager deinit |
+
+> Upgrading from 1.x? See [CHANGELOG.md](CHANGELOG.md#migrating-from-1x) for breaking changes.
 
 ## Configuration
 
@@ -152,6 +155,16 @@ Configure via `idf.py menuconfig` → WiFi Manager:
 | `WIFI_MGR_WEBUI_CUSTOM_PATH` | "" | Custom Web UI path (LittleFS/SPIFFS) |
 | `WIFI_MGR_ENABLE_BLE` | n | Enable BLE GATT interface |
 | `WIFI_MGR_BLE_DEVICE_NAME` | "ESP32-WiFi-{id}" | BLE device name (supports {id}) |
+| `WIFI_MGR_BLE_RELEASE_CLASSIC_BT_MEM` | n | Bluedroid: release Classic BT memory (saves RAM on ESP32, disables Classic BT until reboot) |
+| `WIFI_MGR_MAX_SCAN_RESULTS` | 20 | Max scan results returned by REST/BLE/CLI |
+| `WIFI_MGR_HTTP_MAX_CONTENT_LEN` | 2048 | Max HTTP request body (bytes) |
+| `WIFI_MGR_HTTP_MAX_URI_HANDLERS` | 32 | `max_uri_handlers` for the httpd created by WiFi Manager |
+| `WIFI_MGR_TASK_STACK_SIZE` | 4096 | Manager and DNS task stack size |
+| `WIFI_MGR_TASK_PRIORITY` | 5 | Manager and DNS task priority |
+
+All options also have built-in defaults, so the component can be used without running menuconfig.
+
+**Recommended for captive portal:** `CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024`. Recent Android/Chrome probes send headers larger than the 512-byte default; the server then answers `431` and the portal popup never opens. WiFi Manager logs a warning when the value is lower.
 
 ### Runtime Configuration
 
@@ -183,6 +196,10 @@ wifi_manager_config_t config = {
     .enable_captive_portal = true,
     .stop_ap_on_connect = true,
 
+    // Optional: validate variables before they are saved (any interface)
+    .on_before_var_set = my_var_validator,   // return ESP_OK to accept
+    .var_validator_ctx = NULL,
+
     // HTTP interface
     .http = {
         .enable = true,
@@ -190,6 +207,10 @@ wifi_manager_config_t config = {
         .enable_auth = true,
         .auth_username = "admin",
         .auth_password = "secret",
+        // Optional: runs before every API handler (after CORS, before auth);
+        // return non-ESP_OK to reject with 403
+        .pre_request_hook = my_api_hook,
+        .hook_ctx = NULL,
     },
 
     // mDNS (supports {id} placeholder)
@@ -213,7 +234,9 @@ wifi_manager_init(&config);
 ```c
 // Initialization
 esp_err_t wifi_manager_init(const wifi_manager_config_t *config);
-esp_err_t wifi_manager_deinit(void);
+// deinit_wifi=false keeps the STA connection (and netifs) alive and only
+// tears down the manager, HTTP handlers, BLE service and mDNS
+esp_err_t wifi_manager_deinit(bool deinit_wifi);
 
 // Status
 bool wifi_manager_is_connected(void);
@@ -226,7 +249,7 @@ esp_err_t wifi_manager_connect(const char *ssid);  // NULL for auto-connect
 esp_err_t wifi_manager_disconnect(void);
 esp_err_t wifi_manager_scan(wifi_scan_result_t *results, size_t max, size_t *count);
 
-// Network management
+// Network management (removing the connected network disconnects from it)
 esp_err_t wifi_manager_add_network(const wifi_network_t *network);
 esp_err_t wifi_manager_update_network(const wifi_network_t *network);
 esp_err_t wifi_manager_remove_network(const char *ssid);
@@ -317,6 +340,8 @@ The BLE interface supports two modes of operation depending on whether the appli
 | **Owns the stack** (default) | Initializes BLE host stack + registers GATT service | Tears down everything (service, advertising, host stack, controller) | App doesn't use BLE for anything else |
 | **Service only** | Detects host stack already running, registers GATT service only | Unregisters service and stops advertising, leaves host stack running | App manages the BLE lifecycle |
 
+> **Experimental:** service-only mode has known limitations that still need hardware validation: on NimBLE the service is added after the GATT server has started and deinit calls `ble_gatts_reset()` (which also removes the application's services); on Bluedroid WiFi Manager registers its own GAP/GATTS callbacks, which replaces the application's. Prefer letting WiFi Manager own the stack unless you can test your exact setup.
+
 The mode is detected automatically: if the BLE host stack is already initialized when `wifi_manager_init()` is called, the WiFi Manager registers only its GATT service and leaves the stack alone on deinit. This mirrors the HTTP interface's shared server pattern — if you pass an existing `httpd_handle_t`, the HTTP handlers are unregistered on deinit without stopping the server.
 
 **NimBLE:**
@@ -331,7 +356,7 @@ wifi_manager_init(&(wifi_manager_config_t){
 });
 
 // Later: WiFi Manager removes its GATT service but NimBLE keeps running
-wifi_manager_deinit();
+wifi_manager_deinit(false);
 
 // App can continue using BLE for its own services
 ```
@@ -351,7 +376,7 @@ wifi_manager_init(&(wifi_manager_config_t){
 });
 
 // Later: WiFi Manager unregisters its GATT app but Bluedroid keeps running
-wifi_manager_deinit();
+wifi_manager_deinit(false);
 
 // App can continue using BLE for its own services
 ```
@@ -536,8 +561,8 @@ curl -u admin:password http://192.168.4.1/api/wifi/status
 | GET | `/status` | Get connection status |
 | GET | `/scan` | Scan available networks |
 | GET | `/networks` | List saved networks |
-| POST | `/networks` | Add new network |
-| PUT | `/networks/:ssid` | Update network |
+| POST | `/networks` | Add or update network (upsert; omitted fields keep saved values) |
+| PUT | `/networks/:ssid` | Update network (partial) |
 | DELETE | `/networks/:ssid` | Remove network |
 | POST | `/connect` | Connect (auto or specific SSID) |
 | POST | `/disconnect` | Disconnect |
@@ -550,6 +575,8 @@ curl -u admin:password http://192.168.4.1/api/wifi/status
 | PUT | `/vars/:key` | Set variable |
 | DELETE | `/vars/:key` | Delete variable |
 | POST | `/factory_reset` | Factory reset |
+
+`:ssid` and `:key` are URL-encoded path segments (e.g. `My%20WiFi`). Hidden networks are not listed by `/scan`; add them with `POST /networks` using the exact SSID and connect as usual.
 
 ### Example Requests
 
@@ -639,7 +666,8 @@ curl -X PUT http://192.168.4.1/api/wifi/vars/device_name \
 |-----------|-------------|
 | 400 | Bad Request - Invalid JSON, missing field |
 | 401 | Unauthorized - Auth required |
-| 404 | Not Found - Network/Variable does not exist |
+| 403 | Forbidden - Rejected by `pre_request_hook` |
+| 404 | Not Found - Network/Variable does not exist, or `/connect` to an unsaved SSID |
 | 500 | Internal Error - Operation failed |
 
 ## Connection Flow
@@ -656,9 +684,14 @@ Auto-connect logic:
    b. Exponential backoff between retries
    c. If success → done
    d. If fail → try next network
-3. If all fail and captive_portal enabled → start AP
+3. If all fail and captive_portal enabled → start AP,
+   otherwise keep retrying in the background with backoff (if auto_reconnect)
 4. If connected and disconnected → auto-reconnect if enabled
 ```
+
+Disconnect events from failed attempts are ignored once the sequence has
+connected to a lower-priority network, so a fallback connection is not torn
+down by stale events from the primary network.
 
 ## Captive Portal
 
@@ -671,9 +704,12 @@ When no networks are configured or all connections fail, the device starts a Sof
 
 Supported captive portal detection:
 - Android: `/generate_204`, `/gen_204`
-- iOS/macOS: `/hotspot-detect.html`
-- Windows: `/ncsi.txt`, `/connecttest.txt`
+- iOS/macOS: `/hotspot-detect.html`, `/library/test/success.html`
+- Windows: `/ncsi.txt`, `/connecttest.txt`, `/redirect`
 - Firefox: `/success.txt`, `/canonical.html`
+- Any other unknown path while the AP is active, when WiFi Manager owns the HTTP server (404 handler redirects to the portal)
+
+When you pass your own `httpd` handle, create it with `uri_match_fn = httpd_uri_match_wildcard` and enough `max_uri_handlers` (about 32); WiFi Manager unregisters exactly the handlers it registered on deinit and never replaces your 404 handler.
 
 ## Dependencies
 
