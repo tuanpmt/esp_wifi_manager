@@ -20,6 +20,65 @@
 extern "C" {
 #endif
 
+
+// =============================================================================
+// Configuration Defaults - Typically set via menuconfig
+// =============================================================================
+
+
+#ifndef CONFIG_WIFI_MGR_MAX_NETWORKS
+#define CONFIG_WIFI_MGR_MAX_NETWORKS 5
+#endif
+
+#ifndef CONFIG_WIFI_MGR_MAX_VARS
+#define CONFIG_WIFI_MGR_MAX_VARS 10
+#endif
+
+#ifndef CONFIG_WIFI_MGR_DEFAULT_RETRY
+#define CONFIG_WIFI_MGR_DEFAULT_RETRY 3
+#endif
+
+#ifndef CONFIG_WIFI_MGR_RETRY_INTERVAL_MS
+#define CONFIG_WIFI_MGR_RETRY_INTERVAL_MS 5000
+#endif
+
+#ifndef CONFIG_WIFI_MGR_AP_SSID
+#define CONFIG_WIFI_MGR_AP_SSID "ESP32-Config"
+#endif
+
+#ifndef CONFIG_WIFI_MGR_AP_PASSWORD
+#define CONFIG_WIFI_MGR_AP_PASSWORD ""
+#endif
+
+#ifndef CONFIG_WIFI_MGR_AP_IP
+#define CONFIG_WIFI_MGR_AP_IP "192.168.4.1"
+#endif
+
+#ifndef CONFIG_WIFI_MGR_BLE_DEVICE_NAME
+#define CONFIG_WIFI_MGR_BLE_DEVICE_NAME "ESP32-WiFi-{id}"
+#endif
+
+#ifndef CONFIG_WIFI_MGR_MAX_SCAN_RESULTS
+#define CONFIG_WIFI_MGR_MAX_SCAN_RESULTS 20
+#endif
+
+#ifndef CONFIG_WIFI_MGR_HTTP_MAX_CONTENT_LEN
+#define CONFIG_WIFI_MGR_HTTP_MAX_CONTENT_LEN 2048
+#endif
+
+#ifndef CONFIG_WIFI_MGR_TASK_STACK_SIZE
+#define CONFIG_WIFI_MGR_TASK_STACK_SIZE 4096
+#endif
+
+#ifndef CONFIG_WIFI_MGR_TASK_PRIORITY
+#define CONFIG_WIFI_MGR_TASK_PRIORITY 5
+#endif
+
+#ifndef CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
+#define CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS 32
+#endif
+
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -27,8 +86,11 @@ extern "C" {
 #define WIFI_MGR_NVS_NAMESPACE      "wifi_mgr"
 #define WIFI_MGR_MAX_NETWORKS       CONFIG_WIFI_MGR_MAX_NETWORKS
 #define WIFI_MGR_MAX_VARS           CONFIG_WIFI_MGR_MAX_VARS
-#define WIFI_MGR_TASK_STACK_SIZE    4096
-#define WIFI_MGR_TASK_PRIORITY      5
+#define WIFI_MGR_MAX_SCAN_RESULTS   CONFIG_WIFI_MGR_MAX_SCAN_RESULTS
+#define WIFI_MGR_HTTP_MAX_CONTENT   CONFIG_WIFI_MGR_HTTP_MAX_CONTENT_LEN
+#define WIFI_MGR_TASK_STACK_SIZE    CONFIG_WIFI_MGR_TASK_STACK_SIZE
+#define WIFI_MGR_TASK_PRIORITY      CONFIG_WIFI_MGR_TASK_PRIORITY
+#define WIFI_MGR_HTTP_MAX_HANDLERS  CONFIG_WIFI_MGR_HTTP_MAX_URI_HANDLERS
 #define WIFI_MGR_QUEUE_SIZE         10
 
 // Event bits (for sync waits)
