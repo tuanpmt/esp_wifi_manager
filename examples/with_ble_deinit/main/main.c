@@ -357,7 +357,7 @@ void app_main(void)
 
     // ── Step 4: Deinit WiFi Manager (soft BLE teardown) ──
     ESP_LOGI(TAG, "Step 4: Deinitializing WiFi Manager (BLE service removed, stack stays)");
-    wifi_manager_deinit();
+    wifi_manager_deinit(false);  // keep WiFi connected, only tear down the manager
     ESP_LOGI(TAG, "WiFi Manager deinitialized — NimBLE stack still running");
 
     // ── Step 5: App takes over BLE ──
